@@ -488,6 +488,13 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         set_run(use, f24, coords[bits(x, 61, 3)]);
         set_run(use, f32 & 0x3f, (uint32_t)__builtin_popcount(bits(x, 72, 4)));
     }
+    if (base == 0x197) {                                          // SULD: coordinates by the dimension, a result a channel
+        static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
+        uint32_t n = (uint32_t)__builtin_popcount(bits(x, 72, 4));
+        set_run(use, f24, coords[bits(x, 61, 3)]);
+        if (!predicated) set_run(def, f16, n);
+        else set_run(use, f16, n);
+    }
 }
 
 // ---- uniform registers: definitions, forwarding and the registers they need
@@ -1564,6 +1571,27 @@ static void lower_sust(L *l, const Insn *x) {
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
                 ((uint64_t)hr << 39));
+}
+
+// SULD.P (0xb97): SUST.P's load, the handle from a constant word as there, coordinates at 24-31, destination at
+// 16-23 (one register a channel of the mask at 72-75), dimension 61-63; 81-83 the result predicate (taken only as
+// PT), 84 always set in the game's kernels. Maxwell SULD.B (Ryujinx InstSuldB, 0xeb00): destination 0-7,
+// coordinates 8-15, mask 20-23, result predicate 30-32 (PT), dimension 33-35, handle register 39-46. The fog and
+// atmosphere kernels around main+0x28ed0c read their images so (2026-11-06).
+static void lower_suld(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), coord = bits(x, 24, 8), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
+    if (bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 7 || bits(x, 85, 6) || bits(x, 32, 8) || bits(x, 59, 2) ||
+        mask == 0) {
+        char why[96];
+        snprintf(why, sizeof why, "SULD mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
+    Src h = {0};
+    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (!cbuf_ok(&h)) return (void)fail(l, "SULD handle");
+    uint32_t hr = to_reg(l, h, 4, 0, 0);
+    emit(l, 0xeb00000000000000ull | l->pred | rd | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)PT << 30) |
+                ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
 }
 
 // ---- tensor-core instructions (Turing+), emulated with shuffles and half-precision FMAs
@@ -2774,6 +2802,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x386: case 0x986: return lower_stg(l, x, op);
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
     case 0xb9b: return lower_sust(l, x);
+    case 0xb97: return lower_suld(l, x);
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
     case 0x240: return lower_hmnmx2(l, x, op);
