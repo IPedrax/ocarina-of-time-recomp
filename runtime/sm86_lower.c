@@ -63,6 +63,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 // ---- the lowering context
 
 #define NSCRATCH 12
+#define PROBE_REG 254                                 // OOT_PROBE's capture register (sm86_probe_match)
 #define RZ 255u
 #define PT 7u
 #define NOREG 0xffffffffu
@@ -81,6 +82,7 @@ typedef struct {
     struct { uint32_t out, target; } *imm_reloc;
     uint32_t max_gpr;                              // highest general register the program touches
     uint32_t ur_next, scratch_base;                // the pool above max_gpr: uniform registers from ur_next up
+    int probe; uint32_t probe_index, probe_reg;    // OOT_PROBE (sm86_probe_match): the instruction and register captured
                                                    // to scratch_base, scratch registers from there (allocated
                                                    // on first use, ascending so pairs and runs stay adjacent)
     int nscratch;
@@ -1586,6 +1588,11 @@ static void lower_sust(L *l, const Insn *x) {
     h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
     if (!cbuf_ok(&h)) return (void)fail(l, "SUST handle");
     uint32_t hr = to_reg(l, h, 4, 0, 0);
+    if (l->probe) {   // OOT_PROBE: the capture in every channel written
+        uint32_t n = (uint32_t)__builtin_popcount(mask);
+        for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), PROBE_REG);
+        data = S(l, 0);
+    }
     emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
                 ((uint64_t)hr << 39));
 }
@@ -2880,6 +2887,37 @@ void sm86_lower_free(Sm86Lowered *out) {
     out->code = NULL, out->c1 = NULL;
 }
 
+// ---- OOT_PROBE=<code hash>:<offset>:<register> (diagnostic): a value of one program seen from outside
+// The program whose FNV-1a 64 of its SM86 code (the length the translation is given, as OOT_TENSOR_ONLY and
+// tools/kernel.py print it) starts with <code hash> is lowered with a capture: R254 is zeroed at the start, takes
+// <register> (decimal) right after the SM86 instruction at byte <offset> (hex, the code block's, header included: what
+// tools/sm86_dis.py prints), and every SUST of the program stores R254 in each channel it writes instead of its data.
+// The frame dump's statistics of the images the program writes (images.txt: min, max, NaN count) then describe that
+// register at that point, e.g. whether a value is already NaN there: bisect the instructions to the first that makes
+// one. gfx_shader.c gives the probed program a cache key of its own (its input id stays, so OOT_DUMP=cs: finds it).
+static struct { int parsed, on; char hash[17]; uint32_t offset, reg; } probe_spec;
+static void probe_parse(void) {
+    if (probe_spec.parsed) return;
+    probe_spec.parsed = 1;
+    const char *e = getenv("OOT_PROBE");
+    unsigned off, reg;
+    char h[17];
+    if (e && sscanf(e, "%16[0-9a-fA-F]:%x:%u", h, &off, &reg) == 3 && reg < 255) {
+        snprintf(probe_spec.hash, sizeof probe_spec.hash, "%s", h);
+        probe_spec.offset = off, probe_spec.reg = reg, probe_spec.on = 1;
+    }
+}
+int sm86_probe_match(const uint8_t *code, uint32_t len) {
+    probe_parse();
+    if (!probe_spec.on) return 0;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+    char hex[17];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    return !strncmp(hex, probe_spec.hash, strlen(probe_spec.hash));
+}
+const char *sm86_probe_spec(void) { return getenv("OOT_PROBE"); }
+
 int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out) {
     return sm86_lower_ex(code, code_size, control, control_size, out, sm86_lower_tensor_cores);
 }
@@ -2912,11 +2950,18 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         l.liveness = compute_liveness(&l);
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
     }
+    if (sm86_probe_match(code, code_size)) {
+        if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG) fail(&l, "OOT_PROBE: no register free for the capture");
+        l.probe = 1, l.probe_index = (probe_spec.offset - header) / 16, l.probe_reg = probe_spec.reg;
+        emit(&l, MOV32I | ((uint64_t)7 << 16) | PROBE_REG | ((uint64_t)0xf << 12));   // R254 = 0, unconditionally
+    }
     for (l.index = 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
         lower_one(&l, &l.in[l.index]);
+        if (l.probe && l.index == l.probe_index)   // the capture, unconditionally (a guarded write may not have happened)
+            emit(&l, MOV_R | ((uint64_t)7 << 16) | PROBE_REG | QUAD | ((uint64_t)l.probe_reg << 20));
         int pair;
         uint8_t kind, bank;
         uint32_t value;

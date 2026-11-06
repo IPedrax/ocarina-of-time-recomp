@@ -1224,6 +1224,15 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     UseMask m;
     r->final = use_find(r->code_hash, &m);
     build_key(r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
+    if (sm86_probe_match(code, r->length)) {   // OOT_PROBE: the probed lowering under a key of its own, same input id
+        const char *spec = sm86_probe_spec();
+        uint8_t buf[32 + 64];
+        size_t n = strlen(spec) < 64 ? strlen(spec) : 64;
+        memcpy(buf, r->key, 32), memcpy(buf + 32, spec, n);
+        rt_sha256(buf, 32 + n, r->key);
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 4) rt_log("gfx_shader: OOT_PROBE %s: program found (%u bytes)", spec, r->length);
+    }
     return 1;
 }
 
