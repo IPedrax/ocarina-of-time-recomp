@@ -172,6 +172,17 @@ static uint32_t S(L *l, int k) {
     return l->scratch_base + (uint32_t)k;
 }
 
+// n consecutive scratch registers from index first on whose first register is a multiple of n (Maxwell's 64- and
+// 128-bit operands); RZ, with the lowering failed, when the scratch range has none.
+static uint32_t S_aligned(L *l, int first, uint32_t n) {
+    for (int k = first; k + (int)n <= NSCRATCH; k++)
+        if ((l->scratch_base + (uint32_t)k) % n == 0) {
+            uint32_t r = S(l, k + (int)n - 1);   // claims the run (fails if it is past the free range)
+            return r == RZ ? RZ : r - (n - 1);
+        }
+    return fail(l, "no aligned scratch run"), RZ;
+}
+
 typedef struct Src Src;
 static void to_reg_into(L *l, Src s, uint32_t r);
 static void mov_imm(L *l, uint32_t rd, uint32_t v);
@@ -1532,7 +1543,13 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
 static void lower_stg(L *l, const Insn *x, uint32_t op) {
     uint32_t data = bits(x, 32, 8), size = bits(x, 73, 3), address = bits(x, 24, 8), offset = bits(x, 40, 24);
     if (size > 6 || bits(x, 16, 8)) return (void)fail(l, "STG mode");
-    if (data == RZ && size > 4) return (void)fail(l, "STG of wide zeros");
+    if (data == RZ && size > 4) {   // Maxwell has no wide RZ: zeros in an aligned scratch run (the 1x1x1 kernels
+                                    // before the fog clear 64- and 128-bit slots so, 2026-11-07)
+        uint32_t n = size == 6 ? 4 : 2, z = S_aligned(l, 4, n);
+        if (z == RZ) return;
+        for (uint32_t i = 0; i < n; i++) mov_imm(l, z + i, 0);
+        data = z;
+    }
     if (op == 0x986) {
         uint32_t ubase = ur_pair(l, bits(x, 64, 6), 2);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c101100u;
@@ -2240,28 +2257,34 @@ static void lower_fswzadd(L *l, const Insn *x) {
     emit(l, base(l, 0x50f8000000000000ull, rd, bits(x, 24, 8)) | ((uint64_t)bits(x, 64, 8) << 20) | ((uint64_t)mx << 28));
 }
 
-// REDUX (0x1c4, register form 0x3c4): a reduction of Ra over the warp into a uniform register; operation at 78-80
-// (0 AND, 1 OR, 2 XOR, 3 SUM, 4 MIN, 5 MAX as PTX redux.sync lists them). Taken: SUM and the bitwise ones, every
-// other field clear; MIN and MAX wait for their signedness bit. Maxwell has no reduction: a butterfly of five
-// SHFL.BFLY (lanes 16 to 1, clamp 0x1f, validity to PT) with the operation after each, so every lane ends with the
-// whole warp's result, then a move into the uniform's register. The end-of-frame upscaler sums over the warp
-// (2026-11-06). Like R2UR, it assumes the whole warp active, as the compiler does where it reduces.
-static __attribute__((unused)) void lower_redux(L *l, const Insn *x) {
+// REDUX (0x1c4, register form 0x3c4): a reduction of Ra over the warp's active lanes into a uniform register;
+// operation at 78-80 (0 AND, 1 OR, 2 XOR, 3 SUM, 4 MIN, 5 MAX as PTX redux.sync lists them). Taken: SUM, OR and XOR,
+// every other field clear. Maxwell has no reduction, and a SHFL butterfly would add the undefined values of lanes
+// that have exited (a 2026-11-06 butterfly version let the end-of-frame kernel 745220f3 through and a later frame lost
+// the device). So: the active mask from VOTE (ballot of PT), then each of the 32 lanes' Ra read with SHFL.IDX and
+// ANDed with lane j's mask bit spread to a whole word (SHL to bit 31, arithmetic SHR by 31), so an inactive lane adds
+// the operation's identity 0; then a move into the uniform's register. About 160 instructions, for a rare op.
+static void lower_redux(L *l, const Insn *x) {
     uint32_t target = ur_dst(l, bits(x, 16, 8)), ra = bits(x, 24, 8), kind = bits(x, 78, 3);
-    if (x->w[1] || (x->w[2] & ~(7u << 14)) || kind > 3) {
+    if (x->w[1] || (x->w[2] & ~(7u << 14)) || (kind != 1 && kind != 2 && kind != 3)) {
         char why[96];
         snprintf(why, sizeof why, "REDUX mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
         return (void)fail(l, why);
     }
-    uint32_t v = S(l, 0), t = S(l, 1);
-    mov_reg(l, v, ra);
-    for (uint32_t lane = 16; lane; lane >>= 1) {
-        emit(l, l->pred | 0xef10000000000000ull | t | ((uint64_t)v << 8) | ((uint64_t)lane << 20) | ((uint64_t)1 << 28) |
-                    ((uint64_t)1 << 29) | ((uint64_t)3 << 30) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48));
-        if (kind == 3) emit(l, base(l, 0x5c10000000000000ull, v, v) | ((uint64_t)t << 20));                 // IADD
-        else emit(l, base(l, 0x5c40000000000000ull, v, v) | ((uint64_t)t << 20) | ((uint64_t)kind << 41));  // LOP
+    uint32_t mask = S(l, 0), acc = S(l, 1), t = S(l, 2), b = S(l, 3);
+    emit(l, 0x50d8000000000000ull | l->pred | mask | ((uint64_t)7 << 39) | ((uint64_t)PT << 45) | ((uint64_t)1 << 48));  // VOTE.ANY
+    mov_imm(l, acc, 0);
+    for (uint32_t j = 0; j < 32; j++) {
+        emit(l, l->pred | 0xef10000000000000ull | t | ((uint64_t)ra << 8) | ((uint64_t)j << 20) | ((uint64_t)1 << 28) |
+                    ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48));                          // SHFL.IDX
+        emit(l, base(l, 0x3848000000000000ull, b, mask) | ((uint64_t)(31 - j) << 20));                             // SHL
+        emit(l, base(l, 0x3828000000000000ull, b, b) | ((uint64_t)31 << 20) | ((uint64_t)1 << 48));               // SHR.S32
+        emit(l, base(l, 0x5c40000000000000ull, t, t) | ((uint64_t)b << 20) | ((uint64_t)PT << 48));               // LOP.AND
+        if (kind == 3) emit(l, base(l, 0x5c10000000000000ull, acc, acc) | ((uint64_t)t << 20));                 // IADD
+        else emit(l, base(l, 0x5c40000000000000ull, acc, acc) | ((uint64_t)t << 20) | ((uint64_t)kind << 41) |
+                         ((uint64_t)PT << 48));                                                                     // LOP
     }
-    if (target != RZ) mov_reg(l, target, v);
+    if (target != RZ) mov_reg(l, target, acc);
 }
 
 // R2UR (0x1c2): the uniform takes the register's value (the first active lane's on the console; every lane holds
@@ -2437,7 +2460,17 @@ static void lower_red(L *l, const Insn *x) {
     if ((x->w[2] & ~variable) != mode || (type != 0 && type != 1 && type != 3) || (type == 3 && operation != 0))
         return (void)fail(l, "RED mode");
     uint32_t address = uniform ? ur_pair(l, bits(x, 64, 6), 2) : bits(x, 24, 8);
-    if (address == NOREG || (address & 1)) return (void)fail(l, "RED address");
+    if (address != NOREG && address != RZ && (address & 1)) {   // an odd pair: copied to an even one (Maxwell's .E)
+        uint32_t p = S_aligned(l, 0, 2);
+        if (p == RZ) return;
+        mov_reg(l, p, address), mov_reg(l, p + 1, address + 1);
+        address = p;
+    }
+    if (address == NOREG || (address & 1)) {
+        char why[96];
+        snprintf(why, sizeof why, "RED address %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
     emit(l, 0xebf8000000000000ull | l->pred | data | ((uint64_t)address << 8) | ((uint64_t)type << 20) |
                 ((uint64_t)operation << 23) | ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48));
 }
@@ -2823,7 +2856,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x98e: return lower_red(l, x);
     case 0x3a8: case 0x9a8: return lower_atomg(l, x, op);
     case 0x227: case 0x827: case 0xa27: return lower_imad_hi(l, x);
-    case 0x213: return lower_iabs(l, x);
+    case 0x213: case 0x813: case 0xa13: return lower_iabs(l, x);   // register, immediate, constant (the 6x1x1 kernel before the fog)
     case 0x803: return lower_p2r_r2p(l, x, 0);
     case 0x804: return lower_p2r_r2p(l, x, 1);
     case 0x81c: return lower_plop3(l, x);
@@ -2831,8 +2864,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x806: return lower_vote(l, x);
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
-    // case 0x3c4: lower_redux. Off: with it the end-of-frame kernel 745220f3 translates and a later frame loses the
-    // device (2026-11-06); which of its lowered instructions is wrong is not found yet.
+    case 0x3c4: return lower_redux(l, x);
     default:
         if (base_op >= 0x080 && base_op < 0x100) return lower_uniform_alu(l, x, op);
         char why[80];   // the opcode and words, so the log says which instruction is missing
