@@ -674,6 +674,36 @@ static void draw_trace(Cpu *c, const char *what) {
     rt_log("nvn: %s under program %llu from %s at frame %llu", what, (unsigned long long)serial, ldr_describe(lr, buf, sizeof buf),
            (unsigned long long)frame);
 }
+// DIAG, for the stubbed mesh draws (nvn_procs.c NVN_STUB): each program first drawn with a mesh entry point is logged
+// once, stage by stage, with the FNV-1a hash of the stage's control section (the census's ctl/<key>.ctl, its size at
+// +0xd4) and its stage byte (+0x56: 6 task, 7 mesh), so the mesh programs the game uses can be told apart.
+void nvn_diag_mesh_draw(const char *entry) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static uint64_t seen[64];
+    static int nseen;
+    const prog_t *p = bound_prog;
+    if (!p) return;
+    AcquireSRWLockExclusive(&lock);
+    int known = 0;
+    for (int i = 0; i < nseen && !known; i++) known = seen[i] == p->serial;
+    if (!known && nseen < 64) seen[nseen++] = p->serial;
+    ReleaseSRWLockExclusive(&lock);
+    if (known || nseen >= 64) return;
+    char line[512];
+    int o = snprintf(line, sizeof line, "nvn2 mesh draw (%s): program %llu,", entry, (unsigned long long)p->serial);
+    for (uint32_t i = 0; i < p->nstage && i < 6 && o < (int)sizeof line - 48; i++) {
+        const uint8_t *ctl = p->sd[i].control;
+        if (!ctl) continue;
+        uint32_t size;
+        memcpy(&size, ctl + 0xd4, 4);
+        if (size > 0x1000) size = 0xe0;
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t k = 0; k < size; k++) h = (h ^ ctl[k]) * 0x100000001b3ull;
+        o += snprintf(line + o, sizeof line - o, " stage %u ctl %016llx", ctl[0x56], (unsigned long long)h);
+    }
+    rt_log("%s", line);
+}
+
 NVN_API(nvnCommandBufferBindProgram) {
     bound_prog = arg_p(c, 1);
     *REC(cmd_of(c), OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){arg_p(c, 1), (int)arg_x(c, 2)};

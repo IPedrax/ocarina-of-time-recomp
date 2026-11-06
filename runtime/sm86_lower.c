@@ -1832,7 +1832,9 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
     if ((dim != 1 && !array) || toff == 2 || toff == 3 || bits(x, 81, 3) != 7 || bits(x, 59, 1) || bits(x, 89, 1) ||
         mask == 0 || half || !bits(x, 60, 1) || (bindless && bits(x, 46, 13)) || (!bindless && bank >= 18) ||
         (dc && (toff || array)))
-        return (void)fail(l, "TLD4 mode");
+        { char why[96];   // the words, so a new form can be read off the log
+          snprintf(why, sizeof why, "TLD4 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+          return (void)fail(l, why); }
     int plain = !toff && !dc;
     uint32_t cx = ra, cy = plain && !array ? rb : (ra == RZ ? RZ : ra + 1);
     uint32_t c0;
@@ -1961,15 +1963,81 @@ static void h2_relu(L *l, uint32_t rd) {
     emit(l, l->pred | HMUL2_R(rd, rd, m));
 }
 
-// HMNMX2 (0x040, Ampere): min (predicate 87-90 true) or max of two half pairs; register form, plain operands.
+// HMNMX2 (0x040, Ampere): min (predicate 87-90 true) or max of two half pairs; register form. |a| (73) and |b| (62),
+// placed as FADD's on Turing: the end-of-frame upscaler 430bf485 takes max(|R.H0_H0|, |R.H1_H1|) (2026-11-06).
+// Maxwell's HSET2 and HFMA2 lack an absolute value on every operand, so each one first goes through HADD2 |x| + 0
+// (.ABS_A 44), which also applies the swizzle; the negations (63, 72) stay unsupported.
 static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), b = bits(x, 32, 8), a_swz = bits(x, 74, 2), b_swz = bits(x, 60, 2);
-    int is_min = bits(x, 87, 3) == 7 ? !bits(x, 90, 1) : -1;
-    if (op != 0x240 || is_min < 0 || bits(x, 62, 2) || bits(x, 72, 2) || bits(x, 76, 11)) return (void)fail(l, "HMNMX2 mode");
+    int is_min = bits(x, 87, 3) == 7 ? !bits(x, 90, 1) : -1, a_abs = bits(x, 73, 1), b_abs = bits(x, 62, 1);
+    if (op != 0x240 || is_min < 0 || bits(x, 63, 1) || bits(x, 72, 1) || bits(x, 76, 11)) {
+        char why[96];   // the words, so a new form can be read off the log without the program at hand
+        snprintf(why, sizeof why, "HMNMX2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
+    if (a_abs || b_abs) {   // |x.swz| + 0 into scratch, read back unswizzled (H1_H0 = 0)
+        uint32_t ta = a_abs ? S(l, 3) : a, tb = b_abs ? S(l, 4) : b;
+        if (a_abs) emit(l, l->pred | 0x5d10000000000000ull | ta | ((uint64_t)a << 8) | ((uint64_t)RZ << 20) |
+                               ((uint64_t)1 << 44) | ((uint64_t)a_swz << 47));
+        if (b_abs) emit(l, l->pred | 0x5d10000000000000ull | tb | ((uint64_t)b << 8) | ((uint64_t)RZ << 20) |
+                               ((uint64_t)1 << 44) | ((uint64_t)b_swz << 47));
+        if (a_abs) a = ta, a_swz = 0;
+        if (b_abs) b = tb, b_swz = 0;
+    }
     uint32_t m = S(l, 1), d = S(l, 2);
     emit(l, l->pred | (is_min ? HSET2_GT_BF(m, b, b_swz, a, a_swz) : HSET2_GT_BF(m, a, a_swz, b, b_swz)));
     emit(l, l->pred | HADD2_SUB_R(d, a, a_swz, b, b_swz));
     emit(l, l->pred | (HFMA2_R(rd, m, 0, d, b) | ((uint64_t)b_swz << 35)));
+}
+
+// HMUL2 (0x032): a * b on half pairs; register (0x232, b swizzle 60-61) or a packed half-pair immediate (0x832).
+// Taken: a's swizzle (74-75); everything else in the third word and b's modifiers must be clear. The end-of-frame
+// upscaler 6f1e1e41 doubles a pair (2026-11-06). Maxwell HMUL2 R: a 8, b 20, b swizzle 28-29, a swizzle 47-48.
+static void lower_hmul2(L *l, const Insn *x, uint32_t op) {
+    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), a_swz = bits(x, 74, 2), b, b_swz = 0;
+    if (bits(x, 64, 10) || bits(x, 76, 20)) {
+        char why[96];
+        snprintf(why, sizeof why, "HMUL2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
+    if (op == 0x832) {
+        b = S(l, 0);
+        mov_imm(l, b, x->w[1]);
+    } else if (op == 0x232 && !bits(x, 62, 2)) {
+        b = bits(x, 32, 8), b_swz = bits(x, 60, 2);
+    } else {
+        return (void)fail(l, "HMUL2 form");
+    }
+    emit(l, l->pred | HMUL2_R(rd, a, b) | ((uint64_t)b_swz << 28) | ((uint64_t)a_swz << 47));
+}
+
+// HSETP2 (0x034): compare two half pairs into two predicates, the low halves' result in the predicate at 81-83 and
+// the high halves' at 84-86, each ANDed with the accumulator at 87-89 (negated by 90); compare 76-79 as FSETP's.
+// Register form (0x234, b at 32 with its swizzle at 60) or a packed half-pair immediate (0x434, in the second word).
+// Taken: the combination with the accumulator at 69-70 (AND, OR, XOR) and a's swizzle at 74-75; not taken: a's
+// negation and absolute value (72-73), .H_AND (71), b's modifiers. The end-of-frame upscaler 0a9afab0 compares a
+// pair against {0.1, 0.1}, then one half again ORed with the high result (2026-11-06). Maxwell's HSETP2 register form
+// (0x5d20) with the fields of its HSET2 (0x5d18, above): Pd 3-5, the second predicate 0-2, b swizzle 28-29, compare
+// 35-38, accumulator 39-41 (42), combination 45-46, a swizzle 47-48.
+static void lower_hsetp2(L *l, const Insn *x, uint32_t op) {
+    uint32_t a = bits(x, 24, 8), b, b_swz = 0, combine = bits(x, 69, 2), a_swz = bits(x, 74, 2);
+    if (bits(x, 64, 5) || bits(x, 71, 3) || combine == 3 || bits(x, 80, 1)) {
+        char why[96];
+        snprintf(why, sizeof why, "HSETP2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
+    if (op == 0x434) {
+        b = S(l, 0);
+        mov_imm(l, b, x->w[1]);
+    } else if (op == 0x234 && !bits(x, 62, 2)) {
+        b = bits(x, 32, 8), b_swz = bits(x, 60, 2);
+    } else {
+        return (void)fail(l, "HSETP2 form");
+    }
+    emit(l, l->pred | 0x5d20000000000000ull | bits(x, 84, 3) | ((uint64_t)bits(x, 81, 3) << 3) | ((uint64_t)a << 8) |
+                ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)bits(x, 76, 4) << 35) |
+                ((uint64_t)bits(x, 87, 3) << 39) | ((uint64_t)bits(x, 90, 1) << 42) | ((uint64_t)combine << 45) |
+                ((uint64_t)a_swz << 47));
 }
 
 // F2FP (0x23e, Ampere) .PACK_AB: Rd = (half of Ra) << 16 | half of Rb, rounding 79-80 (round to nearest only).
@@ -2109,6 +2177,30 @@ static void lower_fswzadd(L *l, const Insn *x) {
     if (swz > 0xff || x->w[2] > 255) return (void)fail(l, "FSWZADD mode");
     uint32_t mx = ((swz & 0x55) << 1) | ((swz & 0xaa) >> 1);
     emit(l, base(l, 0x50f8000000000000ull, rd, bits(x, 24, 8)) | ((uint64_t)bits(x, 64, 8) << 20) | ((uint64_t)mx << 28));
+}
+
+// REDUX (0x1c4, register form 0x3c4): a reduction of Ra over the warp into a uniform register; operation at 78-80
+// (0 AND, 1 OR, 2 XOR, 3 SUM, 4 MIN, 5 MAX as PTX redux.sync lists them). Taken: SUM and the bitwise ones, every
+// other field clear; MIN and MAX wait for their signedness bit. Maxwell has no reduction: a butterfly of five
+// SHFL.BFLY (lanes 16 to 1, clamp 0x1f, validity to PT) with the operation after each, so every lane ends with the
+// whole warp's result, then a move into the uniform's register. The end-of-frame upscaler sums over the warp
+// (2026-11-06). Like R2UR, it assumes the whole warp active, as the compiler does where it reduces.
+static __attribute__((unused)) void lower_redux(L *l, const Insn *x) {
+    uint32_t target = ur_dst(l, bits(x, 16, 8)), ra = bits(x, 24, 8), kind = bits(x, 78, 3);
+    if (x->w[1] || (x->w[2] & ~(7u << 14)) || kind > 3) {
+        char why[96];
+        snprintf(why, sizeof why, "REDUX mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
+    uint32_t v = S(l, 0), t = S(l, 1);
+    mov_reg(l, v, ra);
+    for (uint32_t lane = 16; lane; lane >>= 1) {
+        emit(l, l->pred | 0xef10000000000000ull | t | ((uint64_t)v << 8) | ((uint64_t)lane << 20) | ((uint64_t)1 << 28) |
+                    ((uint64_t)1 << 29) | ((uint64_t)3 << 30) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48));
+        if (kind == 3) emit(l, base(l, 0x5c10000000000000ull, v, v) | ((uint64_t)t << 20));                 // IADD
+        else emit(l, base(l, 0x5c40000000000000ull, v, v) | ((uint64_t)t << 20) | ((uint64_t)kind << 41));  // LOP
+    }
+    if (target != RZ) mov_reg(l, target, v);
 }
 
 // R2UR (0x1c2): the uniform takes the register's value (the first active lane's on the console; every lane holds
@@ -2407,7 +2499,9 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 76, 5) || bits(x, 81, 3) != 7 ||
         (lod != 1 && !level) || bits(x, 59, 1) || mask == 0 || (bindless && (bits(x, 46, 13) || !bits(x, 91, 1))) ||
         (!bindless && bank >= 18))
-        return (void)fail(l, "TLD mode");
+        { char why[96];   // the words, so a new form can be read off the log
+          snprintf(why, sizeof why, "TLD mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+          return (void)fail(l, why); }
     uint32_t coords[3], n = 0, lev = RZ;
     if (array || volume) coords[n++] = ra, coords[n++] = ra + 1, coords[n++] = rb;
     else if (dim == 1) coords[n++] = ra, coords[n++] = rb;
@@ -2645,6 +2739,8 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
     case 0x240: return lower_hmnmx2(l, x, op);
+    case 0x234: case 0x434: return lower_hsetp2(l, x, op);
+    case 0x232: case 0x832: return lower_hmul2(l, x, op);
     case 0xb1d: return lower_bar(l, x);
     case 0x83b: return lower_ldsm(l, x);
     case 0x23c: return lower_hmma(l, x);
@@ -2668,9 +2764,13 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x806: return lower_vote(l, x);
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
+    // case 0x3c4: lower_redux. Off: with it the end-of-frame kernel 745220f3 translates and a later frame loses the
+    // device (2026-11-06); which of its lowered instructions is wrong is not found yet.
     default:
         if (base_op >= 0x080 && base_op < 0x100) return lower_uniform_alu(l, x, op);
-        return (void)fail(l, "opcode");
+        char why[80];   // the opcode and words, so the log says which instruction is missing
+        snprintf(why, sizeof why, "opcode %#x: %08x %08x %08x %08x", op, x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
     }
 }
 

@@ -2608,7 +2608,21 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
-    if (!cs) return;
+    if (!cs) {   // which kernels a frame loses, once per program: the size and the game's call site tell them apart
+        static SRWLOCK lock = SRWLOCK_INIT;
+        static uint64_t seen[128];
+        static int nseen;
+        int fresh = 1;
+        AcquireSRWLockExclusive(&lock);
+        for (int i = 0; i < nseen && fresh; i++) fresh = seen[i] != ex->prog->serial;
+        if (fresh && nseen < 128) seen[nseen++] = ex->prog->serial;
+        else fresh = 0;
+        ReleaseSRWLockExclusive(&lock);
+        if (fresh)
+            rt_log("vk: dispatch %dx%dx%d of program %llu from %#llx skipped: its shader did not translate", d->x, d->y,
+                   d->z, (unsigned long long)ex->prog->serial, (unsigned long long)d->caller);
+        return;
+    }
     if (skip_cs(cs)) return;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);

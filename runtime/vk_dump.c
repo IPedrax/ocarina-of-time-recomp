@@ -1030,8 +1030,12 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     last_targets = 0;
     Str b = {0};
     describe_bindings(&b, ex, info);
-    fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx prog %llu caller %#llx, fence %llu\n%s", n, d->x, d->y,
-            d->z, (unsigned long long)shader_hash(cs), (unsigned long long)(ex->prog ? ex->prog->serial : 0),
+    const uint8_t *in_id = gfx_shader_input_id(cs);   // the id OOT_SKIP_CS and OOT_DUMP=cs: take, next to the hash
+    char in_hex[17] = "";
+    for (int i = 0; in_id && i < 8; i++) snprintf(in_hex + 2 * i, 3, "%02x", in_id[i]);
+    fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx (input %s) prog %llu caller %#llx, fence %llu\n%s", n,
+            d->x, d->y, d->z, (unsigned long long)shader_hash(cs), in_hex,
+            (unsigned long long)(ex->prog ? ex->prog->serial : 0),
             (unsigned long long)d->caller, (unsigned long long)ex->fence, b.s ? b.s : "");
     free(b.s);
     for (uint32_t i = 0; i < info->n_bindings && !pass_skip; i++) {   // storage images the dispatch writes

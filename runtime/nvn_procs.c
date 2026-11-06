@@ -29,6 +29,7 @@
 #undef NVN_PROC
 #undef nvnp_nvnDeviceGetProcAddress
 void nvnp_nvnDeviceGetProcAddress(Cpu *c);
+void nvn_diag_mesh_draw(const char *entry);   // nvn_api_cmd.c: the program a mesh draw uses, once per program
 
 // NVN2 names the game loads that have no implementation (nvn_procs_stub.inc): a stub logs its first three calls with
 // the caller and the first arguments and returns 0, so the game runs on and the log shows which procs it uses.
@@ -42,6 +43,7 @@ void nvnp_nvnDeviceGetProcAddress(Cpu *c);
                            (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);      \
         else if (k == 10 || k == 100 || k == 1000 || k == 10000 || k == 100000 || k == 1000000)                       \
             rt_log("nvn2 stub " #n ": %ld calls", (long)k); /* how often a stubbed call is made, by order of size */ \
+        if (strstr(#n, "MeshTasks")) nvn_diag_mesh_draw(#n);                                                        \
         ret_x(c, 0);                                                                                                 \
     }
 #include "nvn_procs_stub.inc"
