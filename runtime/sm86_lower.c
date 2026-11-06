@@ -1147,6 +1147,14 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
     int ext = bits(x, 74, 1);
     uint32_t cin = bits(x, 87, 3), cin_inv = bits(x, 90, 1);
     if (!ext && bits(x, 87, 4) != 15) return (void)fail(l, "LEA carry in without .X");
+    if (neg_b && !bits(x, 80, 1) && cout == 7 && !ext && !neg_a) {
+        // (a << shift) - b, as SHL then IADD with NegB (AvgMode 1 at 48, Ryujinx InstIaddR): the end-of-frame
+        // upscale kernel d5e222be (2026-11-06)
+        uint32_t t = S(l, 2), rb = to_reg(l, b, 1, 0, 0);
+        emit(l, base(l, 0x3848000000000000ull, t, a.reg) | ((uint64_t)shift << 20));   // SHL imm
+        emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)rb << 20) | ((uint64_t)1 << 48));
+        return;
+    }
     if (neg_b) return (void)fail(l, "LEA negated addend");
     if (bits(x, 80, 1)) {
         // LEA.HI: Rd = Rb + the high word of (Rc:Ra << shift): SHF.L Rt = (Rc:Ra) << shift high, or a right shift
@@ -1829,9 +1837,12 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
     int dc = bits(x, 78, 1), half = bits(x, 79, 1), nodep = bits(x, 90, 1), array = dim == 5;
     int bindless = op == 0xf63;
     uint32_t handle = bindless ? to_reg(l, ur_src(l, bits(x, 40, 6)), 4, 0, 0) : RZ;
-    if ((dim != 1 && !array) || toff == 2 || toff == 3 || bits(x, 81, 3) != 7 || bits(x, 59, 1) || bits(x, 89, 1) ||
-        mask == 0 || half || !bits(x, 60, 1) || (bindless && bits(x, 46, 13)) || (!bindless && bank >= 18) ||
-        (dc && (toff || array)))
+    // Per-tap offsets (2): two packed registers in Rb, Rb+1, eight bits a value as Maxwell's (Ryujinx EmitTld4 reads
+    // 6-bit fields at 8-bit steps), taken over as they are; fp16 (79): Maxwell gathers floats, packed below as TEX's
+    // fp16 results are. The end-of-frame upscale kernel 92491530 gathers with both (2026-11-06).
+    if ((dim != 1 && !array) || toff == 3 || bits(x, 81, 3) != 7 || bits(x, 59, 1) || bits(x, 89, 1) ||
+        mask == 0 || !bits(x, 60, 1) || (bindless && bits(x, 46, 13)) || (!bindless && bank >= 18) ||
+        (dc && (toff || array)) || (toff == 2 && (rb == RZ || array)))
         { char why[96];   // the words, so a new form can be read off the log
           snprintf(why, sizeof why, "TLD4 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
           return (void)fail(l, why); }
@@ -1859,11 +1870,12 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
             mov_cbuf(l, S(l, 4), &s);
         }
         if (extra != RZ) mov_reg(l, S(l, 5), extra);
+        if (toff == 2) mov_reg(l, S(l, 6), extra + 1);   // the second per-tap register
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
     int split = rd2 != RZ;
-    int direct = (components <= 2 || (split ? rd2 == rd + 2 : 1)) && rd != RZ;
+    int direct = !half && (components <= 2 || (split ? rd2 == rd + 2 : 1)) && rd != RZ;
     uint32_t target = direct ? rd : S(l, 0);
     if (!bound) {
         emit(l, 0xdec0000000000000ull | l->pred | target | ((uint64_t)c0 << 8) | ((uint64_t)m0 << 20) |
@@ -1875,6 +1887,17 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
                     ((uint64_t)dc << 50) | ((uint64_t)7 << 51) | ((uint64_t)toff << 54) | ((uint64_t)comp << 56));
     }
     if (direct) return;
+    if (half) {   // (c0, c1) into Rd and (c2, c3) into Rd2 (or Rd+1) as halves, as lower_tex does
+        for (uint32_t pair = 0; pair < 2 && pair * 2 < components; pair++) {
+            uint32_t t = pair == 0 ? rd : split ? rd2 : (rd == RZ ? RZ : rd + 1);
+            if (t == RZ) continue;
+            uint32_t lo = S(l, (int)(pair * 2)), hi = pair * 2 + 1 < components ? S(l, (int)(pair * 2 + 1)) : RZ;
+            emit(l, base(l, 0x5ca8000000000000ull, S(l, 6), 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)lo << 20));
+            emit(l, base(l, 0x5ca8000000000000ull, S(l, 7), 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)hi << 20));
+            emit(l, base(l, 0x5c18000000000000ull, t, S(l, 7)) | ((uint64_t)S(l, 6) << 20) | ((uint64_t)16 << 39));
+        }
+        return;
+    }
     for (uint32_t i = 0; i < components; i++) {
         uint32_t t = (!split || i < 2) ? (rd == RZ ? RZ : rd + i) : rd2 + (i - 2);
         if (t != RZ) mov_reg(l, t, S(l, (int)i));
@@ -1995,6 +2018,7 @@ static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
 // upscaler 6f1e1e41 doubles a pair (2026-11-06). Maxwell HMUL2 R: a 8, b 20, b swizzle 28-29, a swizzle 47-48.
 static void lower_hmul2(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), a_swz = bits(x, 74, 2), b, b_swz = 0;
+    int b_neg = 0, b_abs = 0;
     if (bits(x, 64, 10) || bits(x, 76, 20)) {
         char why[96];
         snprintf(why, sizeof why, "HMUL2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
@@ -2003,12 +2027,21 @@ static void lower_hmul2(L *l, const Insn *x, uint32_t op) {
     if (op == 0x832) {
         b = S(l, 0);
         mov_imm(l, b, x->w[1]);
-    } else if (op == 0x232 && !bits(x, 62, 2)) {
-        b = bits(x, 32, 8), b_swz = bits(x, 60, 2);
+    } else if (op == 0x232) {
+        b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
+    } else if (op == 0xa32) {   // b from a constant bank, with its swizzle and modifiers as the register form's
+        Src s = {0}; s.kind = 2, s.cb_off = bits(x, 38, 16), s.cb_bank = bits(x, 54, 5);
+        if (!cbuf_ok(&s)) return (void)fail(l, "HMUL2 constant");
+        b = S(l, 0), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
+        mov_cbuf(l, b, &s);
     } else {
-        return (void)fail(l, "HMUL2 form");
+        char why[96];
+        snprintf(why, sizeof why, "HMUL2 form %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
     }
-    emit(l, l->pred | HMUL2_R(rd, a, b) | ((uint64_t)b_swz << 28) | ((uint64_t)a_swz << 47));
+    // b's negation as Maxwell's NegA (31: a * -b = -(a * b)), its absolute value as AbsB (30)
+    emit(l, l->pred | HMUL2_R(rd, a, b) | ((uint64_t)b_swz << 28) | ((uint64_t)b_abs << 30) | ((uint64_t)b_neg << 31) |
+                ((uint64_t)a_swz << 47));
 }
 
 // HSETP2 (0x034): compare two half pairs into two predicates, the low halves' result in the predicate at 81-83 and
@@ -2495,8 +2528,10 @@ static void lower_txd(L *l, const Insn *x) {
 static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), rd2 = bits(x, 64, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8);
     uint32_t mask = bits(x, 72, 4), dim = bits(x, 61, 3), tid = bits(x, 40, 14), bank = bits(x, 54, 5), lod = bits(x, 87, 3);
-    int array = dim == 5, volume = dim == 2, level = lod == 3, bindless = op == 0xf66;
-    if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 76, 5) || bits(x, 81, 3) != 7 ||
+    int array = dim == 5, volume = dim == 2, level = lod == 3, bindless = op == 0xf66, toff = bits(x, 76, 1);
+    // .AOFFI (76): one register of packed 4-bit offsets after the level in the Rb list, Maxwell's layout (Ryujinx
+    // EmitTex reads it after the level), taken over as it is (the end-of-frame upscale kernel cdba7256, 2026-11-06).
+    if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 77, 4) || bits(x, 81, 3) != 7 ||
         (lod != 1 && !level) || bits(x, 59, 1) || mask == 0 || (bindless && (bits(x, 46, 13) || !bits(x, 91, 1))) ||
         (!bindless && bank >= 18))
         { char why[96];   // the words, so a new form can be read off the log
@@ -2508,12 +2543,14 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     else coords[n++] = ra;
     if (level) lev = (array || volume || dim == 1) ? rb + 1 : rb;
     if (level && dim == 0) lev = rb;
+    uint32_t offs = !toff ? RZ : dim == 0 ? rb + (uint32_t)level : rb + 1 + (uint32_t)level;
     int contiguous = coords[0] != RZ;
     for (uint32_t i = 1; i < n; i++) contiguous &= coords[i] == coords[0] + i;
     uint32_t c0 = coords[0];
     if (!contiguous) { for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), coords[i]); c0 = S(l, 0); }
     int bound = !bindless && bank == 2;
-    uint32_t m0 = lev;
+    uint32_t m0 = level ? lev : offs;
+    if (bound && level && toff) mov_reg(l, S(l, 5), lev), mov_reg(l, S(l, 6), offs), m0 = S(l, 5);
     if (!bound) {
         if (bindless) to_reg_into(l, ur_src(l, bits(x, 40, 6)), S(l, 4));
         else {
@@ -2522,6 +2559,7 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
             mov_cbuf(l, S(l, 4), &h);
         }
         if (level) mov_reg(l, S(l, 5), lev);
+        if (toff) mov_reg(l, S(l, 5 + level), offs);
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
@@ -2531,7 +2569,7 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t mdim = array ? 3 : volume ? 4 : dim == 1 ? 2 : 0;
     emit(l, (bound ? 0xdc00000000000000ull : 0xdd00000000000000ull) | l->pred | target | ((uint64_t)c0 << 8) | ((uint64_t)m0 << 20) |
                 ((uint64_t)mdim << 28) | ((uint64_t)mask << 31) | ((uint64_t)(bound ? tid : 0) << 36) | ((uint64_t)bits(x, 90, 1) << 49) |
-                ((uint64_t)7 << 51) | ((uint64_t)level << 55));
+                ((uint64_t)7 << 51) | ((uint64_t)level << 55) | ((uint64_t)toff << 35));
     if (direct) return;
     for (uint32_t i = 0; i < components; i++) {
         uint32_t t = (!split || i < 2) ? (rd == RZ ? RZ : rd + i) : rd2 + (i - 2);
@@ -2740,7 +2778,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x23e: return lower_f2fp(l, x, op);
     case 0x240: return lower_hmnmx2(l, x, op);
     case 0x234: case 0x434: return lower_hsetp2(l, x, op);
-    case 0x232: case 0x832: return lower_hmul2(l, x, op);
+    case 0x232: case 0x832: case 0xa32: return lower_hmul2(l, x, op);
     case 0xb1d: return lower_bar(l, x);
     case 0x83b: return lower_ldsm(l, x);
     case 0x23c: return lower_hmma(l, x);
