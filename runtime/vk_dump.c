@@ -574,7 +574,7 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
 
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
-    static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
+    static const char *stn[8] = {"vs", "fs", "?", "?", "?", "cs", "ts", "ms"};
     if (info->n_bindings) {   // DIAG (NVN2 bank 0 layout): every bound texture, image and uniform slot of the stage
         int st = nvn_stage(info->bindings[0].stage);
         sp(b, "    %s bound tex:", stn[st]);

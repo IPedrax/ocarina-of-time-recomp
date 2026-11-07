@@ -73,8 +73,8 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
 | ID | Task | Depends | Status | Done when |
 |---|---|---|---|---|
 | D1 | Enable `VK_EXT_mesh_shader` (`taskShader`, `meshShader`) in `runtime/vk_device.c`, its limits in `runtime/vk_caps.c` (`maxMeshOutputVertices`, `maxMeshOutputPrimitives`, workgroup limits), logged at boot; mesh stages off cleanly where missing. | - | done (2026-11-07): `vk: mesh shaders on` on the RTX 4070 (256 vertices and primitives, 128 invocations, 16 KiB payload) | The boot log names the feature and limits on the RTX 4070. |
-| D2 | Reflection and pipelines: task/mesh stages in `gfx.h` (`GFX_STAGE_*`), `gfx_shader.c` (stage from the control section, translation jobs), `vk_pipeline.c` (a mesh pipeline: task + mesh + fragment, no vertex input or input assembly, its descriptor layout from the stages like the others, the pool set included). | C2, D1 | todo | Mesh pipelines build for the captured programs without validation errors (`OOT_VK_VALIDATION=1`). |
-| D3 | Record and replay the draws: `DrawMeshTasks*` from stubs to recorded ops (`nvn_api_cmd.c`, `nvn_obj.h` payloads, `vk_exec.c` walk), replayed as `vkCmdDrawMeshTasksEXT` / `...IndirectEXT` / `...IndirectCountEXT` with the bound program's mesh pipeline and the same resource binding path as draws (`bind_resources`). | A5, D2 | todo | A level frame dump lists the mesh draws as executed, not skipped. |
+| D2 | Reflection and pipelines: task/mesh stages in `gfx.h` (`GFX_STAGE_*`), `gfx_shader.c` (stage from the control section, translation jobs), `vk_pipeline.c` (a mesh pipeline: task + mesh + fragment, no vertex input or input assembly, its descriptor layout from the stages like the others, the pool set included). | C2, D1 | done (2026-11-07): `gfx_shader.c` builds ts/ms jobs (`mesh_job`), `vk_pipeline_mesh` builds task + mesh + fragment pipelines (single set + pool set, no vertex input); 20+ distinct mesh pipelines build on the level route without errors | Mesh pipelines build for the captured programs without validation errors (`OOT_VK_VALIDATION=1`). |
+| D3 | Record and replay the draws: `DrawMeshTasks*` from stubs to recorded ops (`nvn_api_cmd.c`, `nvn_obj.h` payloads, `vk_exec.c` walk), replayed as `vkCmdDrawMeshTasksEXT` / `...IndirectEXT` / `...IndirectCountEXT` with the bound program's mesh pipeline and the same resource binding path as draws (`bind_resources`). | A5, D2 | doing: OP_DRAW_MESH replayed through `vk_rec` packets (direct and indirect); ~2900 mesh draws a run execute, but the picture barely changes (run 379) | A level frame dump lists the mesh draws as executed, not skipped. |
 | D4 | A probe for one mesh program in isolation (as `--probe-cs` for compute): fixed inputs, one draw into an offscreen target, read back. | D3 | todo | The probe draws the expected shape for a hand-made task count and payload. |
 | D5 | Frame dump support: mesh draws in `passes.txt` with their program, counts and bound resources (`vk_dump.c`). | D3 | todo | The level dump's pass 168 lists its mesh draws with their resources. |
 
@@ -154,3 +154,9 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   from the code header's output map (from byte 0x34: system values A, B (position = bits 4-7), a nibble per generic
   vector) and the control section (+0x60 maxima, +0x58 payload); the host must do the same (D2). Next: D2 (mesh
   pipelines and the job fields in `gfx_shader.c`), then D3/D4.
+- 2026-11-07: D2 done, D3 under way. The replay's per-stage state is 8 NVN stages wide (6 task, 7 mesh: the game binds
+  textures to stage 6); `reflection_valid` accepts ts/ms. Run 379: mesh pipelines build, about 2900 mesh draws execute,
+  no device loss, the scene hardly changes. The indirect records read as zeros on the CPU (the GPU writes them in the
+  same submission), so it is open whether the record layout ({x, y, z} assumed) or the shaders are wrong.
+  `OOT_MESH_IND_DIRECT=64` (each indirect draw as 64 workgroups) hung the game (run 381). Next: read a record back from
+  the GPU, and the probe for one mesh program in isolation (D4).

@@ -472,6 +472,8 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 // No-op without vk_pipeline_async_enable, with OOT_PIPE_PREBUILD=0 or with OOT_GPU=null.
 void vk_pipeline_prewarm(void);
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+// A task (may be NULL) + mesh + fragment (s->fs) pipeline for the bound state (docs/mesh.md); built synchronously.
+VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const GfxShader *ms, const VkPipeInfo **info);
 // Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
 // topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU
 // has them dynamic, depth clamp, polygon mode, blend enables, equations, write masks and alpha to coverage. The replay

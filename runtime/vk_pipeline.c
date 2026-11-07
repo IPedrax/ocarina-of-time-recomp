@@ -236,7 +236,8 @@ static void pool_layout_init(VkCtx *c) {
     for (uint32_t i = 0; i < GFX_POOL_BINDINGS; i++) {
         b[i] = (VkDescriptorSetLayoutBinding){i, i == GFX_POOL_SAMPLER ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                               i == GFX_POOL_SAMPLER ? GFX_POOL_SAMPLERS : GFX_POOL_TEXTURES,
-                                              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+                                              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT |
+                                                  (c->has_mesh_shader ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT : 0), NULL};
         bf[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
                 VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
     }
@@ -1171,7 +1172,8 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 
 static VkShaderStageFlags stage_bit(int stage) {
     return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
-                                                                                      : VK_SHADER_STAGE_COMPUTE_BIT;
+         : stage == GFX_STAGE_TS ? VK_SHADER_STAGE_TASK_BIT_EXT : stage == GFX_STAGE_MS ? VK_SHADER_STAGE_MESH_BIT_EXT
+                                 : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
 // One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
@@ -2951,6 +2953,124 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             LB.cs_draw++;
         }
         p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
+    }
+    ReleaseSRWLockExclusive(&P.lock);
+    if (!p) return VK_NULL_HANDLE;
+    if (info) *info = &p->info;
+    return p->info.pipeline;
+}
+
+// ---- mesh pipelines (docs/mesh.md)
+// A task (optional) + mesh + fragment program as one monolithic pipeline: no vertex input or input assembly, the
+// fixed-function state from the GKey of the bound state (its vertex fields left zero), the dynamic states without the
+// vertex input, topology and primitive restart ones, which mesh pipelines must not have. Bindings as layout_get's single
+// set: the task shader's from 1, the mesh shader's and the fragment shader's moved past the ones before them (the
+// modules rebound). Built on the draw's thread and cached like the others.
+static VkPipeline mesh_create(const VkPipeState *s, const GKey *k, const GfxShader *sh[3], const uint32_t off[3], const Layout *l) {
+    static const VkShaderStageFlagBits bits[3] = {VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkShaderModule mod[3] = {0};
+    VkPipelineShaderStageCreateInfo st[3];
+    uint32_t n = 0;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    for (int i = 0; i < 3; i++) {
+        if (!sh[i]) continue;
+        uint64_t w;
+        const uint32_t *code = gfx_shader_spirv(sh[i], &w);
+        uint32_t *r = off[i] ? spirv_rebind(code, w, off[i]) : NULL;
+        mod[i] = make_module(r ? r : code, w);
+        free(r);
+        if (!mod[i]) goto out;
+        st[n++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = bits[i],
+                                                    .module = mod[i], .pName = "main"};
+    }
+    VkPipelineViewportDepthClipControlCreateInfoEXT clip = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
+                                                            .negativeOneToOne = k->minus_w};
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+        .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .pNext = P.pv_last ? &pvs : NULL, .depthClampEnable = k->clamp,
+                                                 .polygonMode = (VkPolygonMode)k->poly_mode, .lineWidth = 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples, .alphaToCoverageEnable = k->a2c};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .maxDepthBounds = 1.0f};
+    VkPipelineColorBlendAttachmentState cba[8];
+    memset(cba, 0, sizeof cba);
+    for (int i = 0; i < k->n_color; i++) {
+        const uint8_t *b = k->blend[i];
+        cba[i].blendEnable = k->blend_en >> i & 1;
+        cba[i].srcColorBlendFactor = (VkBlendFactor)b[0], cba[i].dstColorBlendFactor = (VkBlendFactor)b[1];
+        cba[i].colorBlendOp = (VkBlendOp)b[2], cba[i].srcAlphaBlendFactor = (VkBlendFactor)b[3];
+        cba[i].dstAlphaBlendFactor = (VkBlendFactor)b[4], cba[i].alphaBlendOp = (VkBlendOp)b[5];
+        cba[i].colorWriteMask = k->wmask >> (4 * i) & 0xf;
+    }
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .logicOpEnable = k->logic_op != 0,
+                                              .logicOp = k->logic_op ? (VkLogicOp)(k->logic_op - 1) : VK_LOGIC_OP_COPY,
+                                              .attachmentCount = k->n_color, .pAttachments = cba};
+    VkDynamicState dyn[32];
+    uint32_t nd = 0;
+    for (uint32_t i = 0; i < P.n_dyn; i++)
+        if (P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE &&
+            P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE)
+            dyn[nd++] = P.dyn[i];
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = nd, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->n_color,
+                                        .pColorAttachmentFormats = (const VkFormat *)k->color,
+                                        .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = n,
+                                       .pStages = st, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
+                                       .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy, .layout = l->layout};
+    if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
+    if (r != VK_SUCCESS) rt_log("vk_pipeline: vkCreateGraphicsPipelines for a mesh pipeline failed (%d)", (int)r), pipe = VK_NULL_HANDLE;
+    (void)s;
+out:
+    for (int i = 0; i < 3; i++) if (mod[i]) vkDestroyShaderModule(P.device, mod[i], NULL);
+    return pipe;
+}
+
+VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const GfxShader *ms, const VkPipeInfo **info) {
+    if (info) *info = NULL;
+    if (!ms || !vk_ctx()->has_mesh_shader || !ensure_init()) return VK_NULL_HANDLE;
+    struct { uint32_t tag; const GfxShader *ts, *ms; GKey k; } key;
+    memset(&key, 0, sizeof key);
+    VkPipeState t = *s;
+    t.vs = NULL;
+    gkey_fill(&t, &key.k);
+    key.tag = 0x4853454d;   // "MESH"
+    key.ts = ts, key.ms = ms;
+    key.k.topo_class = 0;
+    memset(key.k.attr_fmt, 0, sizeof key.k.attr_fmt), memset(key.k.attr_off, 0, sizeof key.k.attr_off);
+    memset(key.k.attr_bind, 0, sizeof key.k.attr_bind), memset(key.k.rate, 0, sizeof key.k.rate);
+    uint64_t h = key_hash(&key, sizeof key);
+    AcquireSRWLockExclusive(&P.lock);
+    Pipe *p = pipe_find(&key, sizeof key, h);
+    if (p) {
+        P.stats.hits++;
+    } else {
+        const GfxShader *sh[3] = {ts, ms, s->fs};
+        uint32_t off[3] = {0, 0, 0}, base = 0;
+        Bindings B = {0};
+        const char *why = NULL;
+        for (int i = 0; i < 3 && !why; i++) {
+            if (!sh[i]) continue;
+            off[i] = base;
+            if (!add_stage(&B, sh[i], base)) why = "too many bindings";
+            base += binding_span(sh[i]) - 1;
+        }
+        Layout *l = why ? NULL : layout_get(&B);
+        if (!why && !l) why = "descriptor layout creation failed";
+        VkPipeline pipe = why ? VK_NULL_HANDLE : mesh_create(s, &key.k, sh, off, l);
+        if (!why && !pipe) why = "pipeline creation failed";
+        if (why) {
+            P.stats.failures++;
+            rt_log("vk_pipeline: mesh pipeline not built: %s", why);
+        }
+        p = pipe_add(&key, sizeof key, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, 0);
+        if (pipe) rt_log("vk_pipeline: a mesh pipeline built (%s mesh + fragment, %u bindings)", ts ? "task +" : "", B.n);
     }
     ReleaseSRWLockExclusive(&P.lock);
     if (!p) return VK_NULL_HANDLE;

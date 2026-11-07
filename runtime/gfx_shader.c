@@ -570,7 +570,8 @@ static int reflection_valid(const char *res, uint64_t size) {
     const char *st = strstr(b, "\"stage\"");
     if (!st) return 0;
     st = strchr(st + 7, '"');
-    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
+    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4) ||
+                  !strncmp(st, "\"ts\"", 4) || !strncmp(st, "\"ms\"", 4));   // task and mesh (docs/mesh.md)
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -938,7 +939,8 @@ static void reflect(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : !strcmp(stage, "ts") ? GFX_STAGE_TS
+             : !strcmp(stage, "ms") ? GFX_STAGE_MS : GFX_STAGE_VS;
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
@@ -1229,8 +1231,31 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
     rt_sha256(buf, (size_t)(p - buf), key);
 }
 
+// A task or mesh program's job fields (tools/xlate/Program.cs, docs/mesh.md), from its control section and the code
+// header before the first instruction: the maximum vertices and primitives (control +0x60), the payload (the top byte
+// of +0x58: 1 KiB per 4), and the output lines: each enabled component of the header's VTG output map from byte 0x34
+// in order (system values A, then B, whose bits 4-7 are the position, then a nibble per generic vector), as its target
+// (0-3 position x-w, 4 + location * 4 + component, -1 not carried). The stage buffer goes after the program's own
+// shared memory (none in the game's programs; control +0x50 is local memory).
+typedef struct { uint32_t max_v, max_p, payload_words, nlines, base, bytes; int16_t lines[160]; } MeshJob;
+static void mesh_job(int stage, const uint8_t *control, const uint8_t *code, uint32_t own_shared, MeshJob *m) {
+    uint32_t w60, w58;
+    memcpy(&w60, control + 0x60, 4), memcpy(&w58, control + 0x58, 4);
+    memset(m, 0, sizeof *m);
+    m->max_v = w60 & 0xffff, m->max_p = w60 >> 16, m->payload_words = (w58 >> 24) / 4 * 256;
+    if (stage == GFX_STAGE_MS) {
+        for (int bit = 0; bit < 8; bit++) if (code[0x34] >> bit & 1 && m->nlines < 160) m->lines[m->nlines++] = -1;
+        for (int bit = 0; bit < 8; bit++) if (code[0x35] >> bit & 1 && m->nlines < 160) m->lines[m->nlines++] = (int16_t)(bit >= 4 ? bit - 4 : -1);
+        for (int vec = 0; vec < 32; vec++)
+            for (int c = 0; c < 4; c++)
+                if (code[0x36 + vec / 2] >> (4 * (vec & 1)) & 1 << c && m->nlines < 160) m->lines[m->nlines++] = (int16_t)(4 + vec * 4 + c);
+    }
+    m->base = (own_shared + 15) & ~15u;
+    m->bytes = stage == GFX_STAGE_MS ? (m->max_v * m->nlines * 4 + 4 + 3 * m->max_p + 3) & ~3u : 0x10 + m->payload_words * 4;
+}
+
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl, const MeshJob *mesh) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
@@ -1266,7 +1291,14 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         o += sprintf(o, "},\"fout\":{");
         for (int i = 0; i < 8; i++)
             if (a->frag_out_type[i]) o += sprintf(o, "%s\"%d\":\"%s\"", sep, i, attr_name(a->frag_out_type[i])), sep = ",";
-        o += sprintf(o, "},\"shared\":%u", a->shared_bytes);
+        o += sprintf(o, "},\"shared\":%u", mesh ? mesh->base + mesh->bytes : a->shared_bytes);
+    }
+    if (mesh) {
+        if (!a) o += sprintf(o, ",\"shared\":%u", mesh->base + mesh->bytes);
+        o += sprintf(o, ",\"local\":[32,1,1],\"mesh\":{\"max_vertices\":%u,\"max_primitives\":%u,\"base\":%u,\"payload_words\":%u,\"lines\":[",
+                     mesh->max_v, mesh->max_p, mesh->base, mesh->payload_words);
+        for (uint32_t i = 0; i < mesh->nlines; i++) o += sprintf(o, "%s%d", i ? "," : "", mesh->lines[i]);
+        o += sprintf(o, "]}");
     }
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};
@@ -1349,7 +1381,8 @@ typedef struct {
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
     (void)c1;
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs"
+                  : stage == GFX_STAGE_TS ? "ts" : stage == GFX_STAGE_MS ? "ms" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     if (!control || !sm86_control_parse(control, CONTROL_BOUND, &r->ctl)) return fail("bad control section", NULL), 0;
     r->length = r->ctl.code_size;
@@ -1516,7 +1549,10 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)low.c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return sm86_lower_free(&low), plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl);
+    MeshJob mj;
+    int mesh = stage == GFX_STAGE_TS || stage == GFX_STAGE_MS;
+    if (mesh) mesh_job(stage, control, code, a ? a->shared_bytes : 0, &mj);
+    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl, mesh ? &mj : NULL);
     sm86_lower_free(&low);
     int ok = svc_request(req, reply, sizeof reply);
     free(req);
@@ -2222,7 +2258,7 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     if (n < 0) return 1;
     uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
     static const uint8_t zero[32];
-    size_t u = 0, by[3] = {0}, stages[6] = {0};
+    size_t u = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
     for (long long i = 0; recs && i < n; i++) {           // seed records come in priority order: the first id wins
         if (!memcmp(iid[i], zero, 32) || !set_add(&seen, hash8(iid[i]))) continue;
