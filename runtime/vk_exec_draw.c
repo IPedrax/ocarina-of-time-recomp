@@ -480,6 +480,52 @@ static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
+// Bytes of a texel of an uncompressed colour format; 0 for the others (compressed, depth, packed YUV, unknown).
+static uint32_t texel_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_R5G5B5A1_UNORM_PACK16: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        return 2;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32_SFLOAT:
+        return 4;
+    case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+        return 8;
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+    default: return 0;
+    }
+}
+
+// The format of a view that reinterprets the texture's bits in another format of the same texel size (NVN's
+// nvnTextureViewSetFormat), or 0 to keep the texture's. OoT's end-of-frame kernel 3ce2b98c packs R11G11B10F texels
+// itself and stores them through an R32UI view of the R11G11B10F target: with the texture's format the shader's
+// integer image met a float view, the stores were lost and the scene's unmapped HDR went to the screen, white
+// (2026-11-07, frame dump pass 163). The images are MUTABLE_FORMAT (vk_texture.c). OOT_VIEW_FORMAT=0: off.
+static VkFormat reinterpret_format(const VkTexImage *img, const view_t *v, int hv, int storage) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("OOT_VIEW_FORMAT"); off = e && !strcmp(e, "0"); }
+    if (off || !hv || !v->set_format || img->block_views || img->storage_format || img->alpha_one || img->chan[0] ||
+        img->aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+        return 0;
+    TexVkFormat b;
+    if (!tex_vk_format(v->format, &b) || b.vk != b.ideal || b.depth || b.stencil || b.vk == img->format) return 0;
+    uint32_t n = texel_bytes(img->format);
+    if (!n || texel_bytes(b.vk) != n) return 0;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, b.vk, &fp);
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!(fp.optimalTilingFeatures & need)) return 0;
+    return b.vk;
+}
+
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
@@ -535,6 +581,14 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     VkFormat vf = storage && img->storage_format ? img->storage_format : img->format;   // sRGB stored through UNORM
+    VkFormat rf = reinterpret_format(img, v, hv, storage);
+    if (rf) {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 8)
+            rt_log("vk_exec: %s view of image %#llx (%ux%u vk format %d) in its view format %d", storage ? "storage" : "sampled",
+                   (unsigned long long)img->addr, img->width, img->height, (int)img->format, (int)rf);
+        vf = rf;
+    }
     ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -545,7 +599,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                       .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views || img->storage_format) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
+    if (img->block_views || img->storage_format || rf) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
                                                                      // (vk_texture.c); an sRGB image's STORAGE usage is its UNORM view's
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
