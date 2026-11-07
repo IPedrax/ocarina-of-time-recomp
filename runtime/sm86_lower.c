@@ -1032,7 +1032,11 @@ static void lower_isetp(L *l, const Insn *x) {
     emit(l, w);
 }
 
-// SEL (0x007) and FSEL (0x008): a when the predicate at 87-89 (90) holds, else b.
+// SEL (0x007) and FSEL (0x008): a when the predicate at 87-89 (90) holds, else b. Both become Maxwell SEL, which moves
+// bits: its immediate is the integer I20 form whatever the source, so an FSEL constant takes the integer rule (1.0 does
+// not fit and goes through a scratch register). With the float rule, FSEL's 1.0 became SEL's integer 0x3f800, a
+// denormal read as 0: the fog kernel's trilinear light weights (FSEL 1e-5 : 1.0) all came out 0 and the RCP of their
+// sum gave its NaN (2026-11-07, OOT_PROBE on 1a62084a).
 static void lower_sel(L *l, const Insn *x, int floating) {
     uint32_t rd = bits(x, 16, 8);
     Src a = src0(x, floating), b = srcn(l, x, 1, floating);
@@ -1040,7 +1044,7 @@ static void lower_sel(L *l, const Insn *x, int floating) {
     int is32;
     uint64_t w;
     if (b.neg || b.abs_) w = 0x5ca0000000000000ull | ((uint64_t)to_reg(l, b, 1, 0, 0) << 20);
-    else w = b_slot(l, b, 0x5ca0000000000000ull, 0x4ca0000000000000ull, 0x38a0000000000000ull, 0, floating, 1, &is32);
+    else w = b_slot(l, b, 0x5ca0000000000000ull, 0x4ca0000000000000ull, 0x38a0000000000000ull, 0, 0, 1, &is32);
     w |= l->pred | rd | ((uint64_t)ra << 8) | ((uint64_t)bits(x, 87, 3) << 39) | ((uint64_t)bits(x, 90, 1) << 42);
     emit(l, w);
 }
