@@ -1,0 +1,17 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -759,8 +759,12 @@
+                     result,
+                     out Operand resultValue))
+                 {
+-                    functionId = 0;
+-                    return false;
++                    // ocarina-of-time-recomp: a target that gets no storage buffer binding (the shader's own buffers
++                    // and the 16 storage-table entries of the fallback above exceed the 16 bindings) is skipped: its
++                    // range check falls through to the next target. Upstream dropped the whole function, and every
++                    // access through it read 0 (the level's fog kernel 1a62084a lost all its light-grid reads).
++                    context.MarkLabel(lblSkip);
++                    continue;
+                 }
+ 
+                 if (resultValue != null)

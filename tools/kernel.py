@@ -25,7 +25,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "build" / "v131072" / "shader-cache"
-TOOL = ROOT / "build" / "tools" / "sm86_lower"
+WINDOWS = sys.platform == "win32"   # native Windows (toolchain/msys64) rather than WSL
+TOOL = ROOT / "build" / "tools" / ("sm86_lower.exe" if WINDOWS else "sm86_lower")
+MSYS_BIN = ROOT / "toolchain" / "msys64" / "ucrt64" / "bin"
 XLATE = ROOT / "build" / "xlate" / "oot_xlate.exe"
 VKSDK = Path("/mnt/c/VulkanSDK")
 NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFMA", 0x231: "HFMA2", 0x235: "HADD2",
@@ -35,6 +37,8 @@ NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFM
 
 
 def wpath(p: Path) -> str:
+    if WINDOWS:
+        return str(p)
     return subprocess.check_output(["wslpath", "-w", str(p)], text=True).strip()
 
 
@@ -79,8 +83,10 @@ def build_tool() -> Path:
     srcs = [ROOT / "tools" / "sm86_lower_main.c", ROOT / "runtime" / "sm86_lower.c", ROOT / "runtime" / "sm86_lower.h"]
     if not TOOL.exists() or any(s.stat().st_mtime > TOOL.stat().st_mtime for s in srcs):
         TOOL.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["gcc", "-O1", "-w", "-I", str(ROOT / "runtime"), "-DSM86_TOOL", str(srcs[0]), str(srcs[1]),
-                        "-o", str(TOOL)], check=True)
+        cc = str(MSYS_BIN / "gcc.exe") if WINDOWS and (MSYS_BIN / "gcc.exe").exists() else "gcc"
+        subprocess.run([cc, "-O1", "-w", "-I", str(ROOT / "runtime"), "-DSM86_TOOL", str(srcs[0]), str(srcs[1]),
+                        "-o", str(TOOL)], check=True,
+                       env=dict(__import__("os").environ, PATH=str(MSYS_BIN) + ";" + __import__("os").environ["PATH"]) if WINDOWS else None)
     return TOOL
 
 
@@ -93,7 +99,9 @@ def extract(k: dict, out: Path) -> None:
 def lower(k: dict, out: Path, tensor: bool) -> tuple[Path, Path]:
     extract(k, out)
     low, c1 = out / f"{k['id'][:16]}.low", out / f"{k['id'][:16]}.c1"
-    env = {"SM86_TENSOR": "1" if tensor else "0", "PATH": "/usr/bin:/bin"}
+    env = {"SM86_TENSOR": "1" if tensor else "0", "PATH": str(MSYS_BIN) if WINDOWS else "/usr/bin:/bin"}
+    if WINDOWS:
+        env["SYSTEMROOT"] = __import__("os").environ.get("SYSTEMROOT", r"C:\Windows")
     r = subprocess.run([str(build_tool()), str(out / "ctl"), str(out / "code"), str(low), str(c1)], env=env,
                        capture_output=True, text=True)
     print((r.stdout + r.stderr).strip())
@@ -105,6 +113,8 @@ def lower(k: dict, out: Path, tensor: bool) -> tuple[Path, Path]:
 
 
 def spirv_tools() -> tuple[Path | None, Path | None]:
+    if WINDOWS and (MSYS_BIN / "spirv-val.exe").exists():
+        return MSYS_BIN / "spirv-val.exe", MSYS_BIN / "spirv-dis.exe"
     bins = sorted(VKSDK.glob("*/Bin"))
     if not bins:
         return None, None

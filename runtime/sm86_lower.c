@@ -82,7 +82,7 @@ typedef struct {
     struct { uint32_t out, target; } *imm_reloc;
     uint32_t max_gpr;                              // highest general register the program touches
     uint32_t ur_next, scratch_base;                // the pool above max_gpr: uniform registers from ur_next up
-    int probe; uint32_t probe_index, probe_reg;    // OOT_PROBE (sm86_probe_match): the instruction and register captured
+    int probe, nprobe; uint32_t probe_index[3], probe_reg[3];   // OOT_PROBE (sm86_probe_match): the instruction and register captured
                                                    // to scratch_base, scratch registers from there (allocated
                                                    // on first use, ascending so pairs and runs stay adjacent)
     int nscratch;
@@ -1590,7 +1590,7 @@ static void lower_sust(L *l, const Insn *x) {
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     if (l->probe) {   // OOT_PROBE: the capture in every channel written
         uint32_t n = (uint32_t)__builtin_popcount(mask);
-        for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), PROBE_REG);
+        for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), PROBE_REG - i % (uint32_t)l->nprobe);
         data = S(l, 0);
     }
     emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
@@ -2895,7 +2895,7 @@ void sm86_lower_free(Sm86Lowered *out) {
 // The frame dump's statistics of the images the program writes (images.txt: min, max, NaN count) then describe that
 // register at that point, e.g. whether a value is already NaN there: bisect the instructions to the first that makes
 // one. gfx_shader.c gives the probed program a cache key of its own (its input id stays, so OOT_DUMP=cs: finds it).
-static struct { int parsed, on; char hash[17]; uint32_t offset, reg; } probe_spec;
+static struct { int parsed, on, as_int, n; char hash[17]; uint32_t offset[3], reg[3]; } probe_spec;
 static void probe_parse(void) {
     if (probe_spec.parsed) return;
     probe_spec.parsed = 1;
@@ -2904,7 +2904,16 @@ static void probe_parse(void) {
     char h[17];
     if (e && sscanf(e, "%16[0-9a-fA-F]:%x:%u", h, &off, &reg) == 3 && reg < 255) {
         snprintf(probe_spec.hash, sizeof probe_spec.hash, "%s", h);
-        probe_spec.offset = off, probe_spec.reg = reg, probe_spec.on = 1;
+        probe_spec.offset[0] = off, probe_spec.reg[0] = reg, probe_spec.on = 1, probe_spec.n = 1;
+        // ,<offset>:<register> up to three captures in one run: the k-th goes to R(254 - k), and every SUST writes
+        // capture (channel % n) in each channel, so the dump's per-channel statistics answer three questions at once
+        for (const char *p = strchr(e, ','); p && probe_spec.n < 3; p = strchr(p + 1, ','))
+            if (sscanf(p + 1, "%x:%u", &off, &reg) == 2 && reg < 255)
+                probe_spec.offset[probe_spec.n] = off, probe_spec.reg[probe_spec.n] = reg, probe_spec.n++;
+        // <code hash>:<offset>:<register>:i captures the register as an unsigned integer converted to float, so the
+        // float statistics of the dump read integers (counts, indices, addresses' low words below 2^24 exactly)
+        const char *t = strrchr(e, ':');
+        probe_spec.as_int = t && t[1] == 'i';
     }
 }
 int sm86_probe_match(const uint8_t *code, uint32_t len) {
@@ -2951,17 +2960,28 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
     }
     if (sm86_probe_match(code, code_size)) {
-        if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG) fail(&l, "OOT_PROBE: no register free for the capture");
-        l.probe = 1, l.probe_index = (probe_spec.offset - header) / 16, l.probe_reg = probe_spec.reg;
-        emit(&l, MOV32I | ((uint64_t)7 << 16) | PROBE_REG | ((uint64_t)0xf << 12));   // R254 = 0, unconditionally
+        if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG + 1 - (uint32_t)probe_spec.n)
+            fail(&l, "OOT_PROBE: no register free for the capture");
+        l.probe = 1, l.nprobe = probe_spec.n;
+        for (int k = 0; k < l.nprobe; k++) {
+            l.probe_index[k] = (probe_spec.offset[k] - header) / 16, l.probe_reg[k] = probe_spec.reg[k];
+            emit(&l, MOV32I | ((uint64_t)7 << 16) | (PROBE_REG - (uint32_t)k) | ((uint64_t)0xf << 12));   // = 0, unconditionally
+        }
     }
     for (l.index = 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
         lower_one(&l, &l.in[l.index]);
-        if (l.probe && l.index == l.probe_index)   // the capture, unconditionally (a guarded write may not have happened)
-            emit(&l, MOV_R | ((uint64_t)7 << 16) | PROBE_REG | QUAD | ((uint64_t)l.probe_reg << 20));
+        for (int k = 0; l.probe && k < l.nprobe; k++) {
+            uint32_t cap = PROBE_REG - (uint32_t)k;
+            if (l.index != l.probe_index[k]) continue;
+            if (probe_spec.as_int)   // I2F.F32.U32, unconditionally
+                emit(&l, 0x5cb8000000000000ull | ((uint64_t)7 << 16) | cap | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) |
+                             ((uint64_t)l.probe_reg[k] << 20));
+            else   // the capture, unconditionally (a guarded write may not have happened)
+                emit(&l, MOV_R | ((uint64_t)7 << 16) | cap | QUAD | ((uint64_t)l.probe_reg[k] << 20));
+        }
         int pair;
         uint8_t kind, bank;
         uint32_t value;

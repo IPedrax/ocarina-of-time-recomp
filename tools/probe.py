@@ -23,7 +23,7 @@ def run_probe(args, offset, reg, tag):
     out = ROOT / 'build' / 'logs' / f'probe-{tag}'
     if (out / 'images.txt').exists():
         (out / 'images.txt').unlink()
-    env = [f'OOT_PROBE={args.hash}:{offset:x}:{reg}', f'OOT_DUMP=cs:{args.input}', f'OOT_DUMP_DIR={out.relative_to(ROOT).as_posix()}']
+    env = [f'OOT_PROBE={args.hash}:{offset:x}:{reg}' + (':i' if args.int else ''), f'OOT_DUMP=cs:{args.input}', f'OOT_DUMP_DIR={out.relative_to(ROOT).as_posix()}']
     cmd = [sys.executable, str(ROOT / 'tools' / 'run.py'), '--kill-existing', '--seconds', str(args.seconds), '--replay',
            args.replay, '--skip-movies', '--expect', 'OOT_PROBE .*program found']
     for e in env + list(args.env):
@@ -53,6 +53,7 @@ def main():
     ap.add_argument('--input', required=True)
     ap.add_argument('--at', type=lambda s: int(s, 0))
     ap.add_argument('--reg', type=int)
+    ap.add_argument('--int', action='store_true', help='capture the register as an unsigned integer (I2F)')
     ap.add_argument('--bisect', type=Path)
     ap.add_argument('--seconds', type=int, default=100)
     ap.add_argument('--replay', default='build/logs/a-spam.txt')

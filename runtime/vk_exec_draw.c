@@ -1103,11 +1103,17 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     return a;
 }
 
+static uint32_t ptr_slots[6];   // per NVN stage: storage slots ptr_targets_add filled for the dispatch or draw being recorded
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
     VkDescriptorBufferInfo bi;
     int ubo, slot = ssbo_slot(r, st, &ubo);
+    // A pointer target is bound for reading: the storage-table fallback (translator patch 0019) marks every slot of a
+    // kernel written as soon as one store goes through it, and a write-back of each target per dispatch cost the
+    // level's frames most of a second of replay (2026-11-07).
+    if (st >= 0 && st < 6 && !ubo && slot >= 0 && slot < 16 && (ptr_slots[st] >> slot & 1)) written = 0;
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
@@ -2603,19 +2609,32 @@ static int skip_cs(const GfxShader *cs) {
 // as the CPU wrote them) that is an address of backed GPU memory outside the bound ones takes a free storage slot for
 // that dispatch, sized to what its span holds (up to PTR_SPAN); the game's bindings come back after it.
 enum { PTR_SCAN = 1024, PTR_SPAN = 64 << 20 };
+// The buffer's bytes are readable in place when an imported pool backs them (guest memory the CPU wrote); device
+// pools are not. Not VirtualQuery: on the level's large committed regions it walked page tables for milliseconds per
+// call, 16 calls per dispatch, most of a second per frame (2026-11-07, OOT_PROFILE_RENDER).
 static int ptr_readable(uint64_t a, uint64_t n) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!a || !VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    VkMemSpan sp;
+    return a && vk_mem_resolve(a, n, &sp) && sp.pool;
 }
-static int ptr_targets_add(VkExec *ex, p_bind_buf saved[16]) {
-    p_bind_buf *sb = ex->ssbo[NVN_STAGE_CS];
+// st: NVN_STAGE_CS for a dispatch, NVN_STAGE_VS or NVN_STAGE_FS for a draw (the stages whose storage table the
+// translator's fallback searches: c0 0x310, 0x110, 0x510).
+static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
+    p_bind_buf *sb = ex->ssbo[st];
     memcpy(saved, sb, 16 * sizeof *sb);
     int added = 0;
-    static int off = -1;   // OOT_PTR_BIND=0 (diagnostic): no pointer targets bound
-    if (off < 0) { const char *e = getenv("OOT_PTR_BIND"); off = e && !strcmp(e, "0"); }
-    if (off) return 0;
+    ptr_slots[st] = 0;
+    static int off = -1, off_gfx;   // OOT_PTR_BIND=0 (diagnostic): no pointer targets bound; OOT_PTR_BIND_GFX=0: none for draws
+    static uint64_t span_max;   // OOT_PTR_SPAN=<bytes> (diagnostic): the most a target binds
+    if (off < 0) {
+        const char *e = getenv("OOT_PTR_BIND");
+        off = e && !strcmp(e, "0");
+        e = getenv("OOT_PTR_BIND_GFX");
+        off_gfx = e && !strcmp(e, "0");
+        e = getenv("OOT_PTR_SPAN");
+        span_max = e && *e ? strtoull(e, NULL, 0) : PTR_SPAN;
+        if (e && *e) rt_log("vk_exec: OOT_PTR_SPAN: pointer targets bind at most %llu bytes", (unsigned long long)span_max);
+    }
+    if (off || (st != NVN_STAGE_CS && off_gfx)) return 0;
     for (int k = 0; k < 16; k++) {
         uint64_t base = saved[k].addr, size = saved[k].size;
         if (!base || !size || size > PTR_SCAN || (base & 7) || !ptr_readable(base, size)) continue;
@@ -2629,12 +2648,19 @@ static int ptr_targets_add(VkExec *ex, p_bind_buf saved[16]) {
             }
             VkMemSpan sp;
             if (known || free_slot < 0 || !vk_mem_resolve(v, 16, &sp)) continue;
-            sb[free_slot] = (p_bind_buf){NVN_STAGE_CS, free_slot, v, sp.avail < PTR_SPAN ? sp.avail : PTR_SPAN};
+            sb[free_slot] = (p_bind_buf){st, free_slot, v, sp.avail < span_max ? sp.avail : span_max};
+            ptr_slots[st] |= 1u << free_slot;
             added++;
-            static int logged;
-            if (logged++ < 8)
-                rt_log("vk_exec: pointer %#llx at %#llx+%#llx of storage slot %d bound to free slot %d for a dispatch (%llu bytes)",
-                       (unsigned long long)v, (unsigned long long)base, (unsigned long long)o, k, free_slot,
+            static uint32_t seen[64];   // logged once per (stage, storage slot, offset) the pointer was found at
+            static int nseen;
+            uint32_t where = (uint32_t)st << 24 | (uint32_t)k << 16 | (uint32_t)o;
+            int fresh = nseen < 64;
+            for (int i = 0; i < nseen && fresh; i++) fresh = seen[i] != where;
+            if (fresh) seen[nseen++] = where;
+            if (fresh)
+                rt_log("vk_exec: pointer %#llx at %#llx+%#llx of %s storage slot %d bound to free slot %d (%llu bytes)",
+                       (unsigned long long)v, (unsigned long long)base, (unsigned long long)o,
+                       st == NVN_STAGE_CS ? "compute" : st == NVN_STAGE_VS ? "vertex" : "fragment", k, free_slot,
                        (unsigned long long)sb[free_slot].size);
         }
     }
@@ -2691,10 +2717,31 @@ static void op_dispatch_ind_body(VkExec *ex, const p_dispatch_ind *d);
 // A dispatch with the pointer targets of its storage buffers bound for it (ptr_targets_add), then the game's bindings.
 static void op_dispatch_ptr(VkExec *ex, const void *payload, int indirect) {
     p_bind_buf saved[16];
-    int added = ptr_targets_add(ex, saved);
+    int added = ptr_targets_add(ex, NVN_STAGE_CS, saved);
     if (indirect) op_dispatch_ind_body(ex, payload);
     else op_dispatch_body(ex, payload);
+    ptr_slots[NVN_STAGE_CS] = 0;
     if (added) memcpy(ex->ssbo[NVN_STAGE_CS], saved, sizeof saved);
+}
+
+// A draw with the pointer targets of its vertex and fragment storage buffers bound for it (Kokiri's lighting reads
+// light records through such pointers, as Hookshot's commit ffcdb71 found), then the game's bindings. Draws without a
+// pointer keep their bindings untouched, so their resource sets stay cached.
+static void op_draw_ptr(VkExec *ex, int op, const void *payload) {
+    static const int st[2] = {NVN_STAGE_VS, NVN_STAGE_FS};
+    p_bind_buf saved[2][16];
+    int added[2];
+    for (int i = 0; i < 2; i++) added[i] = ptr_targets_add(ex, st[i], saved[i]);
+    switch (op) {
+    case OP_DRAW: op_draw(ex, payload); break;
+    case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
+    case OP_DRAW_IND: op_draw_ind(ex, payload); break;
+    default: op_draw_idx_ind(ex, payload); break;
+    }
+    for (int i = 0; i < 2; i++) {
+        ptr_slots[st[i]] = 0;
+        if (added[i]) memcpy(ex->ssbo[st[i]], saved[i], sizeof saved[i]);
+    }
 }
 
 // OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible
@@ -2973,11 +3020,8 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     }
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
-    case OP_DRAW: op_draw(ex, payload); break;
-    case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_IND: op_draw_ptr(ex, op, payload); break;
     case OP_DISPATCH: op_dispatch_ptr(ex, payload, 0); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
-    case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
-    case OP_DRAW_IND: op_draw_ind(ex, payload); break;
     case OP_DISPATCH_IND: op_dispatch_ptr(ex, payload, 1); ex->push_cc_len = 0; break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }

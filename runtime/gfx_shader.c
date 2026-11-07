@@ -1244,14 +1244,40 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
 static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, const uint8_t *code,
                                       const GfxShaderAnswers *a, int *pending);
 
+// Keys whose synchronous translation failed, so a failing compute shader is not translated again on every dispatch
+// (2026-11-07: three kernels of the level failed some 30 times a frame, a tenth of a second of the render thread). The
+// background path keeps its failures in X.waits instead.
+typedef struct Failed { struct Failed *next; uint8_t key[32]; } Failed;
+static struct { SRWLOCK lock; Failed *head[256]; } FAILED = {SRWLOCK_INIT};
+
+static int failed_known(const uint8_t key[32]) {
+    AcquireSRWLockShared(&FAILED.lock);
+    const Failed *f = FAILED.head[key[0]];
+    while (f && memcmp(f->key, key, 32)) f = f->next;
+    ReleaseSRWLockShared(&FAILED.lock);
+    return f != NULL;
+}
+
+static void failed_note(const uint8_t key[32]) {
+    Failed *f = calloc(1, sizeof *f);
+    if (!f) return;
+    memcpy(f->key, key, 32);
+    AcquireSRWLockExclusive(&FAILED.lock);
+    f->next = FAILED.head[key[0]], FAILED.head[key[0]] = f;
+    ReleaseSRWLockExclusive(&FAILED.lock);
+}
+
 static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
                                 const GfxShaderAnswers *a) {
     GfxShader *s = mem_find(r->key);
     if (s) return InterlockedIncrement64(&n_hits), s;
+    if (failed_known(r->key)) return NULL;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
     if (r->final && (s = disk_load(r->key, r->iid))) return InterlockedIncrement64(&n_hits), mem_insert(s);
-    return translate(r, stage, control, code, a);
+    const GfxShader *t = translate(r, stage, control, code, a);
+    if (!t) failed_note(r->key);
+    return t;
 }
 
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
