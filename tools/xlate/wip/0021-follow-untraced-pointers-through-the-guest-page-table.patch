@@ -1,0 +1,254 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -368,6 +368,9 @@
+             return TypeInt(32, true);
+         }
+ 
++        // ocarina-of-time-recomp (patch 0021): the module declares PhysicalStorageBuffer addressing (guest page table accesses)
++        public bool UsesPhysicalPointers;
++
+         public Instruction TypeU32()
+         {
+             return TypeInt(32, false);
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1762,14 +1762,35 @@
+         {
+             SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType);
+ 
++            // ocarina-of-time-recomp (patch 0021): PhysicalStorageBuffer accesses carry their alignment.
++            bool physical = operation.StorageKind == StorageKind.GlobalMemory;
++
+             if (isStore)
+             {
+-                context.Store(pointer, context.Get(varType, operation.GetSource(operation.SourcesCount - 1)));
++                SpvInstruction value = context.Get(varType, operation.GetSource(operation.SourcesCount - 1));
++
++                if (physical)
++                {
++                    context.Store(pointer, value, MemoryAccessMask.Aligned).AddOperand((Spv.Generator.LiteralInteger)4);
++                }
++                else
++                {
++                    context.Store(pointer, value);
++                }
++
+                 return OperationResult.Invalid;
+             }
+             else
+             {
+-                SpvInstruction result = context.Load(context.GetType(varType), pointer);
++                SpvInstruction result = physical
++                    ? context.Load(context.GetType(varType), pointer, MemoryAccessMask.Aligned)
++                    : context.Load(context.GetType(varType), pointer);
++
++                if (physical)
++                {
++                    result.AddOperand((Spv.Generator.LiteralInteger)4);
++                }
++
+                 return new OperationResult(varType, result);
+             }
+         }
+@@ -1785,6 +1806,28 @@
+ 
+             switch (storageKind)
+             {
++                case StorageKind.GlobalMemory:
++                    // ocarina-of-time-recomp (patch 0021): GlobalToStorage leaves a global access only once its address
++                    // is a device address (EmitGuestPageWalk): a 32-bit word through a PhysicalStorageBuffer pointer.
++                    if (!context.UsesPhysicalPointers)
++                    {
++                        context.UsesPhysicalPointers = true;
++                        context.AddCapability(Capability.PhysicalStorageBufferAddresses);
++                        context.AddCapability(Capability.Int64);
++                        context.AddExtension("SPV_KHR_physical_storage_buffer");
++                        context.SetMemoryModel(AddressingModel.PhysicalStorageBuffer64, MemoryModel.GLSL450);
++                    }
++
++                    SpvInstruction addrPair = context.CompositeConstruct(
++                        context.TypeVector(context.TypeU32(), 2),
++                        context.GetU32(operation.GetSource(0)),
++                        context.GetU32(operation.GetSource(1)));
++                    SpvInstruction addr64 = context.Bitcast(context.TypeInt(64, false), addrPair);
++
++                    varType = AggregateType.U32;
++
++                    return context.ConvertUToPtr(context.TypePointer(StorageClass.PhysicalStorageBuffer, context.TypeU32()), addr64);
++
+                 case StorageKind.ConstantBuffer:
+                 case StorageKind.StorageBuffer:
+                     if (operation.GetSource(srcIndex++) is not AstOperand bindingIndex || bindingIndex.Type != OperandType.Constant)
+--- a/src/Ryujinx.Graphics.Shader/SupportBuffer.cs
++++ b/src/Ryujinx.Graphics.Shader/SupportBuffer.cs
+@@ -25,6 +25,7 @@
+         TfeOffset,
+         TfeVertexCount,
+         PointSize,
++        GuestPages, // ocarina-of-time-recomp (patch 0021): the guest page table's directory, a 64-bit device address
+     }
+ 
+     public struct SupportBuffer
+@@ -82,7 +83,8 @@
+                 new StructureField(AggregateType.Array | AggregateType.FP32, "render_scale", RenderScaleMaxCount),
+                 new StructureField(AggregateType.Vector4 | AggregateType.S32, "tfe_offset"),
+                 new StructureField(AggregateType.S32, "tfe_vertex_count"),
+-                new StructureField(AggregateType.FP32, "point_size")
++                new StructureField(AggregateType.FP32, "point_size"),
++                new StructureField(AggregateType.Vector4 | AggregateType.U32, "guest_pages")
+             ]);
+         }
+ 
+@@ -98,5 +100,6 @@
+         public Vector4<int> TfeOffset;
+         public Vector4<int> TfeVertexCount;
+         public Vector4<float> PointSize;
++        public Vector4<int> GuestPages;
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -222,8 +222,15 @@
+ 
+             foreach (BasicBlock block in blocks)
+             {
+-                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
+-                {
++                // ocarina-of-time-recomp (patch 0021): the next node is taken before the current one may be deleted (a
++                // store that found no binding, below). Upstream stepped from the deleted node, whose Next is null once it
++                // leaves the list: the rest of the block kept its global accesses and the SPIR-V backend threw.
++                LinkedListNode<INode> next;
++
++                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = next)
++                {
++                    next = node.Next;
++
+                     if (node.Value is not Operation operation)
+                     {
+                         continue;
+@@ -246,7 +253,13 @@
+ 
+                             gpuAccessor.Log($"Failed to reserve storage buffer for global memory operation \"{operation.Inst}\".");
+ 
+-                            if (operation.Dest != null)
++                            if (operation.StorageKind == StorageKind.GlobalMemory)
++                            {
++                                // ocarina-of-time-recomp (patch 0021): no binding left, but the guest page table
++                                // reaches any address: the access is kept and follows it.
++                                EmitGuestPageWalk(node, operation);
++                            }
++                            else if (operation.Dest != null)
+                             {
+                                 operation.TurnIntoCopy(Const(0));
+                             }
+@@ -257,7 +270,7 @@
+                         }
+                         else
+                         {
+-                            node = nextNode;
++                            next = nextNode.Next;
+                         }
+                     }
+                     else if (operation.Inst == Instruction.Store &&
+@@ -284,6 +297,70 @@
+             }
+         }
+ 
++        // ocarina-of-time-recomp (patch 0021): TryGenerateMultiTargetStorageOp's functionId when the access is to follow
++        // its pointer through the guest page table.
++        private const int FollowPointer = -2;
++
++        // ocarina-of-time-recomp (patch 0021): the access's 40-bit guest address becomes a device address. The host's guest
++        // page table (runtime/vk_memory.c, "guest page table"), whose directory address is the support buffer's
++        // guest_pages, has 1024 directory entries (one per GiB) of blocks of 262144 entries (one per 4 KiB page), each
++        // the 64-bit device address of the page's first byte; unbacked pages point at a zeroed page. The access keeps
++        // its global storage kind with the device address as its source: the SPIR-V backend reads, writes or updates
++        // it through a PhysicalStorageBuffer pointer. 32-bit arithmetic on address pairs, as the IR has no 64-bit integers.
++        private static void EmitGuestPageWalk(LinkedListNode<INode> node, Operation operation)
++        {
++            Operand lo = operation.GetSource(0);
++            Operand hi = operation.GetSource(1);
++
++            Operand Emit(Instruction inst, params Operand[] sources)
++            {
++                Operand dest = Local();
++                node.List.AddBefore(node, new Operation(inst, dest, sources));
++                return dest;
++            }
++
++            Operand LoadGuest(Operand addrLo, Operand addrHi)
++            {
++                Operand dest = Local();
++                node.List.AddBefore(node, new Operation(Instruction.Load, StorageKind.GlobalMemory, dest, addrLo, addrHi));
++                return dest;
++            }
++
++            (Operand, Operand) AddOffset(Operand baseLo, Operand baseHi, Operand offset)
++            {
++                Operand sumLo = Emit(Instruction.Add, baseLo, offset);
++                Operand carry = Emit(Instruction.CompareLessU32, sumLo, baseLo);
++                Operand sumHi = Emit(Instruction.Add, baseHi, Emit(Instruction.ConditionalSelect, carry, Const(1), Const(0)));
++                return (sumLo, sumHi);
++            }
++
++            Operand dirLo = Local();
++            Operand dirHi = Local();
++            node.List.AddBefore(node, new Operation(Instruction.Load, StorageKind.ConstantBuffer, dirLo,
++                Const(SupportBuffer.Binding), Const((int)SupportBufferField.GuestPages), Const(0)));
++            node.List.AddBefore(node, new Operation(Instruction.Load, StorageKind.ConstantBuffer, dirHi,
++                Const(SupportBuffer.Binding), Const((int)SupportBufferField.GuestPages), Const(1)));
++
++            // Directory entry: address >> 30, 8 bytes each.
++            Operand gib = Emit(Instruction.BitwiseAnd,
++                Emit(Instruction.BitwiseOr, Emit(Instruction.ShiftLeft, hi, Const(2)), Emit(Instruction.ShiftRightU32, lo, Const(30))),
++                Const(1023));
++            (Operand e1Lo, Operand e1Hi) = AddOffset(dirLo, dirHi, Emit(Instruction.ShiftLeft, gib, Const(3)));
++            Operand blockLo = LoadGuest(e1Lo, e1Hi);
++            Operand blockHi = LoadGuest(Emit(Instruction.Add, e1Lo, Const(4)), e1Hi);   // 8-aligned: no carry
++
++            // Block entry: (address >> 12) & 0x3ffff.
++            Operand page = Emit(Instruction.BitwiseAnd, Emit(Instruction.ShiftRightU32, lo, Const(12)), Const(0x3ffff));
++            (Operand e2Lo, Operand e2Hi) = AddOffset(blockLo, blockHi, Emit(Instruction.ShiftLeft, page, Const(3)));
++            Operand pageLo = LoadGuest(e2Lo, e2Hi);
++            Operand pageHi = LoadGuest(Emit(Instruction.Add, e2Lo, Const(4)), e2Hi);
++
++            (Operand devLo, Operand devHi) = AddOffset(pageLo, pageHi, Emit(Instruction.BitwiseAnd, lo, Const(0xfff)));
++
++            operation.SetSource(0, devLo);
++            operation.SetSource(1, devHi);
++        }
++
+         private static bool IsGlobalMemory(StorageKind storageKind)
+         {
+             return storageKind is StorageKind.GlobalMemory or
+@@ -388,6 +465,13 @@
+                     operation,
+                     out int functionId))
+                 {
++                    if (functionId == FollowPointer)
++                    {
++                        EmitGuestPageWalk(node, operation);
++
++                        return node;
++                    }
++
+                     return null;
+                 }
+ 
+@@ -657,6 +741,16 @@
+             }
+ 
+             targetCbs.Sort();
++
++            if (targetCbs.Count == 0 && operation.StorageKind == StorageKind.GlobalMemory)
++            {
++                // ocarina-of-time-recomp (patch 0021): a 32-bit access whose address traces to no constant buffer entry
++                // follows the pointer through the guest page table (EmitGuestPageWalk). The level's GPU-driven kernels
++                // walk chains of pointers that no set of 16 bindings can cover.
++                functionId = FollowPointer;
++
++                return false;
++            }
+ 
+             if (targetCbs.Count == 0)
+             {

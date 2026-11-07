@@ -217,6 +217,9 @@ const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
 void vk_headroom_start(void);
 void vk_headroom_stop(void);   // before vmaDestroyAllocator
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// Device address of the guest page table's directory (vk_memory.c), which shaders read through the support buffer to
+// follow untraced pointers (translator patch 0021); 0 before the first pool or without buffer device address.
+uint64_t vk_mem_guest_pages(void);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);

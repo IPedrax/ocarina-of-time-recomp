@@ -100,6 +100,7 @@ static VkBufferUsageFlags pool_usage(const VkCtx *c) {
                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    if (c->has_buffer_device_address) u |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;   // the guest page table
     if (c->has_transform_feedback)
         u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     if (c->has_conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
@@ -150,7 +151,10 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         r->buf = VK_NULL_HANDLE;
         return 0;
     }
+    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};   // the guest page table
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                           .pNext = c->has_buffer_device_address ? &af : NULL,
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
@@ -242,6 +246,93 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     free(r);
 }
 
+// ---------------------------------------------------------------- guest page table
+// Shaders follow pointers into any guest memory (translator patch 0021): an address no constant buffer entry traces
+// is looked up here, on the GPU. Two levels over 40-bit guest addresses: a directory of 1024 entries (one per GiB),
+// each the device address of a block of 262144 entries (one per 4 KiB page), each the device address of the page's
+// first byte in the buffer backing it (an import's host buffer, a physical pool's buffer, or through a virtual pool's
+// page the physical pool's). Unbacked pages point at a zeroed page and unused GiBs at a block of those, so a lookup
+// never meets a null pointer. Host-visible buffers, written under pool_lock as pools come, map and go; the support
+// buffer gives shaders the directory's address (vk_exec_draw.c support_fill). The design follows Hookshot's
+// gpu/vk/vk_memory.cpp memory_guest_pages (MIT, Copyright (c) 2026 NotRexed: one level over 8 GiB there); the code is
+// ours. Mirrors are not followed: the pages are the guest's own memory, as the CPU sees it.
+enum { GPT_DIR = 1024, GPT_BLOCK = 1u << 18, GPT_ZERO = 0x10000 };
+typedef struct { VkBuffer b; VmaAllocation a; uint64_t *map; uint64_t addr; } GptBuf;
+static struct {
+    int state;                         // 0 not tried, 1 on, -1 off (no buffer device address)
+    GptBuf dir, zero, zblock, block[GPT_DIR];
+} G;
+
+static uint64_t buf_addr(VkBuffer b) {
+    VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
+    return vkGetBufferDeviceAddress(vk_ctx()->device, &i);
+}
+
+static int gpt_buf(uint64_t size, GptBuf *o) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                  .usage = VMA_MEMORY_USAGE_AUTO};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &o->b, &o->a, &info) != VK_SUCCESS || !info.pMappedData) return 0;
+    o->map = info.pMappedData;
+    o->addr = buf_addr(o->b);
+    return o->addr != 0;
+}
+
+static void gpt_fill(GptBuf *b, uint64_t n, uint64_t v) {
+    for (uint64_t i = 0; i < n; i++) b->map[i] = v;
+    vmaFlushAllocation(vk_ctx()->vma, b->a, 0, VK_WHOLE_SIZE);
+}
+
+// pool_lock exclusive.
+static int gpt_on(void) {
+    if (G.state) return G.state > 0;
+    G.state = -1;
+    if (!vk_ctx()->has_buffer_device_address) {
+        rt_log("vk: no buffer device address: shaders read 0 through untraced pointers");
+        return 0;
+    }
+    if (!gpt_buf(GPT_ZERO, &G.zero) || !gpt_buf((uint64_t)GPT_BLOCK * 8, &G.zblock) || !gpt_buf(GPT_DIR * 8, &G.dir)) {
+        rt_log("vk: the guest page table could not be made: shaders read 0 through untraced pointers");
+        return 0;
+    }
+    memset(G.zero.map, 0, GPT_ZERO);
+    vmaFlushAllocation(vk_ctx()->vma, G.zero.a, 0, VK_WHOLE_SIZE);
+    gpt_fill(&G.zblock, GPT_BLOCK, G.zero.addr);
+    gpt_fill(&G.dir, GPT_DIR, G.zblock.addr);
+    G.state = 1;
+    rt_log("vk: guest page table at %#llx", (unsigned long long)G.dir.addr);
+    return 1;
+}
+
+// Guest pages [lo, hi) to the buffer whose first byte backs guest address base (dev 0: unbacked). pool_lock exclusive.
+static void gpt_set(uint64_t lo, uint64_t hi, VkBuffer buf, uint64_t base) {
+    if (!gpt_on()) return;
+    uint64_t dev = buf ? buf_addr(buf) : 0;
+    int touched = -1;
+    for (uint64_t p = lo & ~0xfffull; p < hi; p += 0x1000) {
+        uint64_t d = p >> 30;
+        if (d >= GPT_DIR) break;
+        GptBuf *b = &G.block[d];
+        if (!b->b) {
+            if (!dev) continue;   // nothing to clear in an untouched GiB
+            if (!gpt_buf((uint64_t)GPT_BLOCK * 8, b)) { rt_log("vk: guest page table block %llu failed", (unsigned long long)d); return; }
+            gpt_fill(b, GPT_BLOCK, G.zero.addr);
+            G.dir.map[d] = b->addr;
+            vmaFlushAllocation(vk_ctx()->vma, G.dir.a, 0, VK_WHOLE_SIZE);
+        }
+        b->map[(p >> 12) & (GPT_BLOCK - 1)] = dev && p >= base ? dev + (p - base) : G.zero.addr;
+        if (touched != (int)d) {
+            if (touched >= 0) vmaFlushAllocation(vk_ctx()->vma, G.block[touched].a, 0, VK_WHOLE_SIZE);
+            touched = (int)d;
+        }
+    }
+    if (touched >= 0) vmaFlushAllocation(vk_ctx()->vma, G.block[touched].a, 0, VK_WHOLE_SIZE);
+}
+
+uint64_t vk_mem_guest_pages(void) { return G.state > 0 ? G.dir.addr : 0; }
+
 int vk_pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
@@ -280,6 +371,9 @@ int vk_pool_init(pool_t *p) {
     if (!ok) { free(r->pt); free(r); return 0; }
     AcquireSRWLockExclusive(&pool_lock);
     index_put(r);
+    if (r->kind == POOL_IMPORT && r->buf) gpt_set(r->lo, r->lo + r->size, r->buf, r->import_lo);
+    else if (r->kind == POOL_PHYS) gpt_set(r->lo, r->lo + r->size, r->buf, r->lo);
+    else gpt_on();
     if (r->kind == POOL_PHYS) {
         if (nphys == cap_phys) {
             cap_phys = cap_phys ? cap_phys * 2 : 16;
@@ -301,6 +395,7 @@ void vk_pool_fini(pool_t *p) {
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     PoolRec *r = had ? e.buf : NULL;
     if (r && r->mstate == MS_ON) mirror_forget(r);
+    if (r) gpt_set(r->lo, r->lo + r->size, VK_NULL_HANDLE, 0);
     if (r && r->kind == POOL_PHYS) {
         for (int i = 0; i < nphys; i++)
             if (phys_list[i] == r) { phys_list[i] = phys_list[--nphys]; break; }
@@ -308,7 +403,10 @@ void vk_pool_fini(pool_t *p) {
             PoolRec *v = pool_index.e[i].buf;
             if (v->kind != POOL_VIRT) continue;
             for (uint64_t k = 0; k < v->npages; k++)
-                if (v->pt[k].phys == r) v->pt[k].phys = NULL;
+                if (v->pt[k].phys == r) {
+                    v->pt[k].phys = NULL;
+                    gpt_set(v->lo + k * NVN_VPOOL_PAGE, v->lo + (k + 1) * NVN_VPOOL_PAGE, VK_NULL_HANDLE, 0);
+                }
         }
     }
     ReleaseSRWLockExclusive(&pool_lock);
@@ -348,8 +446,11 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
         }
         uint64_t first = (uint64_t)rq[i].virtual_offset / NVN_VPOOL_PAGE, count = rq[i].size / NVN_VPOOL_PAGE;
         if (first + count > r->npages) { ok = 0; break; }
-        for (uint64_t k = 0; k < count; k++)
-            r->pt[first + k] = (VPage){ph, ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0};
+        for (uint64_t k = 0; k < count; k++) {
+            uint64_t off = ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0, va = r->lo + (first + k) * NVN_VPOOL_PAGE;
+            r->pt[first + k] = (VPage){ph, off};
+            gpt_set(va, va + NVN_VPOOL_PAGE, ph ? ph->buf : VK_NULL_HANDLE, va - off);   // dev + off + (p - va)
+        }
     }
     ReleaseSRWLockExclusive(&pool_lock);
     if (!ok) rt_log("vk: MapVirtual on pool %p failed", (void *)v->mem);

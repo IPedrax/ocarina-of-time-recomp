@@ -36,7 +36,7 @@
 #define MAX_DESC 2048   // a light-list texture array alone is 1024 (tools/xlate/Program.cs)
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 65536u
-#define SUPPORT_BYTES 1408u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
+#define SUPPORT_BYTES 1424u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_CS 5
@@ -1638,6 +1638,8 @@ static void support_fill(uint8_t *b, float w, float h, float point_size) {
     memcpy(b + 160, size, 16);
     const float one = 1.0f;
     memcpy(b + 1392, &point_size, 4);   // point_size (translator patch 0008): vertex shaders that write none output it
+    uint64_t gp = vk_mem_guest_pages();
+    memcpy(b + 1408, &gp, 8);           // guest_pages (translator patch 0021): the guest page table for untraced pointers
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
 }
 
