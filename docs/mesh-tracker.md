@@ -167,3 +167,11 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   (`1cd76332`, SURED 0x59f, now lowered: `lower_sured`; KEY_VERSION 19; `op_dispatch_ind` now logs an indirect
   dispatch skipped for a missing shader); with it the counts are still zero (run 391). Next: the kernel that writes the
   dispatch records' x (an atomic count of visible instances, presumably) and what makes it count nothing.
+- 2026-11-07: found on the way: `op_dispatch_ind` copied the GPU-written group counts to bank 0 + 0x200 (Maxwell's
+  place) for NVN2 kernels too, which read their dispatch size at bank 0 + 0 (`nvn2_c0_fill_cs`): fixed. Not the cause
+  of the zero counts (run 392: still {0, 1, 1} and 0 0 0 0). The zero comes from before the indirect dispatches, from a
+  directly dispatched kernel at the head of the chain (pass 0's 169x1x1 dispatch is the first candidate). Also open:
+  task and mesh shaders read bank 0 (their storage buffer addresses, texture handles), which the replay fills only for
+  stages 5, 0 and 1 (`c0_fill` / `nvn2_c0_fill_cs`): stages 6 and 7 read zeros there. Next: read back the storage
+  buffers of the chain's first kernels (a readback like OOT_MESH_IND_LOG's, over each written binding) to see which
+  stage produces nothing, and give task and mesh stages their bank 0.

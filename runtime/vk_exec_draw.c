@@ -3170,7 +3170,10 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     bind_resources(ex, info);
     twin_dispatch = 0;
     if (B.c0_valid[2]) {   // the shader binds c0
-        VkBufferCopy cp = {ip.offset, B.c0_off[2] + 0x200, sizeof(VkDispatchIndirectCommand)};
+        // The group counts where the shader reads its dispatch size: bank 0 + 0 for an NVN2 (SM86) program
+        // (nvn2_c0_fill_cs), + 0x200 for a Maxwell one. 2026-11-07: the NVN2 kernels of the level's culling chain read 0
+        // there, ran no work and wrote no counts, so every mesh draw drew nothing.
+        VkBufferCopy cp = {ip.offset, B.c0_off[2] + (nvn2_cs(ex, NVN_STAGE_CS) ? 0 : 0x200), sizeof(VkDispatchIndirectCommand)};
         vkCmdCopyBuffer(ex->cb, ip.buffer, B.c0_buf[2], 1, &cp);
         ex->recorded++;
         vk_exec_barrier(ex);
