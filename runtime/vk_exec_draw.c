@@ -1543,6 +1543,26 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
     if (v) out->imageView = v, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 }
 
+// OOT_MESH_IND_LOG=1 (diagnostic): the first indirect mesh records of a submission are copied, after its closing
+// barrier, into a host-visible buffer (vk_exec_pool_feedback) and logged when it completed: the words the GPU wrote.
+#define MI_N 8
+static struct { VkBuffer b; VkDeviceSize o; uint64_t addr; uint64_t prog; } MI[MI_N];
+static int nmi, mi_logged, mi_on = -1;
+static VkBuffer mi_buf;
+static VmaAllocation mi_alloc;
+static const uint32_t *mi_map;
+typedef struct { int n; uint64_t addr[MI_N], prog[MI_N]; } MiDone;
+static void mi_done(void *arg) {
+    MiDone *m = arg;
+    vmaInvalidateAllocation(vk_ctx()->vma, mi_alloc, 0, VK_WHOLE_SIZE);
+    for (int i = 0; i < m->n; i++)
+        rt_log("vk_exec: %s indirect record at %#llx (program %llu) as the GPU wrote it: %08x %08x %08x %08x",
+               m->prog[i] >> 63 ? "dispatch" : "mesh", (unsigned long long)m->addr[i],
+               (unsigned long long)(m->prog[i] & ~(1ull << 63)), mi_map[4 * i], mi_map[4 * i + 1],
+               mi_map[4 * i + 2], mi_map[4 * i + 3]);
+    free(m);
+}
+
 // ---- pool sets (gfx.h GFX_POOL_SET)
 // A shader that samples through a handle it loads from memory indexes arrays standing for the bound texture and
 // sampler pools (the translator's BindlessElimination). Writing those arrays per draw would be some 100,000
@@ -1800,6 +1820,26 @@ void vk_exec_pool_feedback(VkExec *ex) {
         VkBufferCopy r = {0, 0, (VkDeviceSize)p->ntex * 4};
         vkCmdCopyBuffer(ex->cb, p->fb, p->rb, 1, &r);
         n++;
+    }
+    if (nmi) {   // OOT_MESH_IND_LOG: the records this submission's mesh draws read
+        VkCtx *c = vk_ctx();
+        if (!mi_buf) {
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16 * MI_N, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            VmaAllocationCreateInfo ra = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                          .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+            VmaAllocationInfo info;
+            if (vmaCreateBuffer(c->vma, &bi, &ra, &mi_buf, &mi_alloc, &info) != VK_SUCCESS) rt_fatal("vk: mesh record buffer failed");
+            mi_map = info.pMappedData;
+        }
+        MiDone *m = calloc(1, sizeof *m);
+        if (!m) rt_fatal("vk: out of memory");
+        for (int i = 0; i < nmi; i++) {
+            VkBufferCopy r = {MI[i].o, 16 * (VkDeviceSize)i, 16};
+            vkCmdCopyBuffer(ex->cb, MI[i].b, mi_buf, 1, &r);
+            m->addr[i] = MI[i].addr, m->prog[i] = MI[i].prog;
+        }
+        m->n = nmi, mi_logged += nmi, nmi = 0, n++;
+        vk_completion_add(ex->fence, mi_done, m);
     }
     if (!n) return;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -3078,6 +3118,9 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
         VkMemSpan ip;
         if (!vk_mem_resolve(d->ind, 12, &ip) || ip.offset % 4)
             return warn_once(W_INDIRECT, "indirect mesh arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
+        if (mi_on < 0) mi_on = cfg_get("OOT_MESH_IND_LOG") && *cfg_get("OOT_MESH_IND_LOG") == '1';
+        if (mi_on && nmi < MI_N && mi_logged < 48)
+            MI[nmi].b = ip.buffer, MI[nmi].o = ip.offset, MI[nmi].addr = d->ind, MI[nmi].prog = ex->prog->serial, nmi++;
         rec_mesh_tasks_ind(draw_ind_fn, ex->cb, ip.buffer, ip.offset, 1, 12);
         vk_mem_count(ip.cls, VK_MUSE_IND, 12);
     } else {
@@ -3097,8 +3140,24 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
-    if (!cs) return;
+    if (!cs) {   // its translation failed: logged by code hash (tools/kernel.py prints the same), dump-noted
+        const uint8_t *ctl, *code;
+        uint32_t len;
+        uint64_t h = 0xcbf29ce484222325ull;
+        if (vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len))
+            for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+        static uint64_t said[32];
+        static int nsaid;
+        int seen = 0;
+        for (int i = 0; i < nsaid; i++) seen |= said[i] == h;
+        if (!seen && nsaid < 32) said[nsaid++] = h, rt_log("vk_exec: indirect dispatches of compute code %016llx skipped: no shader", (unsigned long long)h);
+        if (vk_dump_armed) vk_dump_note("indirect dispatch skipped: no compute shader (code %016llx)", (unsigned long long)h);
+        return;
+    }
     if (skip_cs(cs)) return;
+    if (mi_on < 0) mi_on = cfg_get("OOT_MESH_IND_LOG") && *cfg_get("OOT_MESH_IND_LOG") == '1';
+    if (mi_on && nmi < MI_N && mi_logged < 48)   // OOT_MESH_IND_LOG: dispatch arguments too (program serial tagged odd)
+        MI[nmi].b = ip.buffer, MI[nmi].o = ip.offset, MI[nmi].addr = d->ind, MI[nmi].prog = ex->prog->serial | 1ull << 63, nmi++;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");

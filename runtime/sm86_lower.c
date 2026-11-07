@@ -1629,6 +1629,24 @@ static void lower_sust(L *l, const Insn *x) {
                 ((uint64_t)hr << 39));
 }
 
+// SURED (0x59f, 2026-11-07: the level's culling kernel 1cd76332, which every mesh draw's indirect counts depend on):
+// an atomic reduction into a surface without a result, the handle from a constant-buffer word as SUST.P's (dword
+// index 40-53, bank 54-58), coordinates 24-31, the value 32-39, dimension 61-63, the reduction 87-89 (Maxwell's
+// numbering, as RED's), U32, .IGN (Lichii lower_to_maxwell.h names the form; behaviour only). Maxwell SURED.B
+// (bindless, Ryujinx InstSuredB, prefix 0xeb50): the value 0-7, coordinates 8-15, size 20-22 (0: U32), the
+// reduction 24-26, dimension 33-35, handle register 39-46.
+static void lower_sured(L *l, const Insn *x) {
+    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 8), dim = bits(x, 61, 3), op = bits(x, 87, 3);
+    if ((x->w[2] & ~0x03800000u) != 0x0010e000u || dim > 5 || bits(x, 59, 2) || bits(x, 16, 8))
+        return (void)fail(l, "SURED mode");
+    Src h = {0};
+    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (!cbuf_ok(&h)) return (void)fail(l, "SURED handle");
+    uint32_t hr = to_reg(l, h, 4, 0, 0);
+    emit(l, 0xeb50000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)op << 24) | ((uint64_t)dim << 33) |
+                ((uint64_t)hr << 39));
+}
+
 // SULD.P (0xb97, 2026-11-06: the level's compute kernels, 23 of them refused for it): SUST.P's layout for the
 // handle (dword index 40-53, bank 54-58), coordinates (24-31) and dimension (61-63), the destination at 16-23 (one
 // register per channel of the mask at 72-75), a predicate result at 81-83 (PT throughout the corpus) and 1 at
@@ -2927,6 +2945,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x947: return lower_bra(l, x);
     case 0x94d: return lower_exit(l, x);
     case 0x923: return lower_isbe(l, x, 0);
+    case 0x59f: return lower_sured(l, x);
     case 0x927: return lower_isbe(l, x, 1);
     case 0x918: case 0x91a: case 0x945: case 0x941: case 0x942: case 0x948: return;   // NOP, DEPBAR, BSSY, BSYNC, BREAK, WARPSYNC
     case 0x95b:

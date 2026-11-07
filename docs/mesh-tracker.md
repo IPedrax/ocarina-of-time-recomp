@@ -160,3 +160,10 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   same submission), so it is open whether the record layout ({x, y, z} assumed) or the shaders are wrong.
   `OOT_MESH_IND_DIRECT=64` (each indirect draw as 64 workgroups) hung the game (run 381). Next: read a record back from
   the GPU, and the probe for one mesh program in isolation (D4).
+- 2026-11-07: `OOT_MESH_IND_LOG=1` copies the first indirect records of each submission (mesh draws and indirect
+  dispatches) after its closing barrier and logs them when it completed. As the GPU wrote them: every mesh record is
+  0 0 0 0 and every indirect dispatch of the culling chain is {0, 1, 1}, so the culling kernels run zero workgroups and
+  write no meshlet counts. The record layout is not the problem. One kernel of the chain had no shader
+  (`1cd76332`, SURED 0x59f, now lowered: `lower_sured`; KEY_VERSION 19; `op_dispatch_ind` now logs an indirect
+  dispatch skipped for a missing shader); with it the counts are still zero (run 391). Next: the kernel that writes the
+  dispatch records' x (an atomic count of visible instances, presumably) and what makes it count nothing.
