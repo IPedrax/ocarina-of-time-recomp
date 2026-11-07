@@ -31,9 +31,13 @@ def run_probe(args, offset, reg, tag):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     status = [l for l in r.stdout.splitlines() if l.startswith('run:')]
     images = (out / 'images.txt').read_text().splitlines() if (out / 'images.txt').exists() else []
+    for png in out.glob('*.png'):   # a frame dump is hundreds of MB of PNGs; only images.txt is read
+        png.unlink()
     first = [l for l in images if l.startswith('pass_0000_img')]
-    nan = sum(int(m.group(1)) for l in first if (m := re.search(r' nan (\d+)$', l)))
-    total = sum(int(w) * int(h) * int(d) * 3 for l in first
+    # Only images in a float format can hold NaN (the name ends in the format: ..._r11g11b10f, ..._rgba16f).
+    floats = [l for l in first if l.split()[0].endswith('f')]
+    nan = sum(int(m.group(1)) for l in floats if (m := re.search(r' nan (\d+)$', l)))
+    total = sum(int(w) * int(h) * int(d) * 3 for l in floats
                 for w, h, d in re.findall(r' (\d+)x(\d+)x(\d+) min', l))
     print(f'@{offset:#06x} R{reg}: {"; ".join(status[-1:])}')
     for l in first:

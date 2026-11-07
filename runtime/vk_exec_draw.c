@@ -2595,7 +2595,53 @@ static int skip_cs(const GfxShader *cs) {
     return skip;
 }
 
-static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+// Pointers in storage buffers (translator patch 0019): a kernel may load a 64-bit address from a bound buffer and read
+// through it (the level's fog kernel 1a62084a takes its light data from the pointer at +0x20 of its 64-byte storage
+// slot 2). The translator cannot trace such an address and looks it up at run time among the entries of the storage
+// table (c0 + 0x310), where the game binds only its own slots; the buffer the pointer leads to is not among them, and
+// the read gave 0. So before a dispatch, every 8-byte word of the small bound storage buffers (up to PTR_SCAN bytes,
+// as the CPU wrote them) that is an address of backed GPU memory outside the bound ones takes a free storage slot for
+// that dispatch, sized to what its span holds (up to PTR_SPAN); the game's bindings come back after it.
+enum { PTR_SCAN = 1024, PTR_SPAN = 64 << 20 };
+static int ptr_readable(uint64_t a, uint64_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!a || !VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+}
+static int ptr_targets_add(VkExec *ex, p_bind_buf saved[16]) {
+    p_bind_buf *sb = ex->ssbo[NVN_STAGE_CS];
+    memcpy(saved, sb, 16 * sizeof *sb);
+    int added = 0;
+    static int off = -1;   // OOT_PTR_BIND=0 (diagnostic): no pointer targets bound
+    if (off < 0) { const char *e = getenv("OOT_PTR_BIND"); off = e && !strcmp(e, "0"); }
+    if (off) return 0;
+    for (int k = 0; k < 16; k++) {
+        uint64_t base = saved[k].addr, size = saved[k].size;
+        if (!base || !size || size > PTR_SCAN || (base & 7) || !ptr_readable(base, size)) continue;
+        for (uint64_t o = 0; o + 8 <= size; o += 8) {
+            uint64_t v = *(const uint64_t *)(uintptr_t)(base + o);
+            if (v < 0x10000 || (v >> 40) || (v & 3)) continue;
+            int known = 0, free_slot = -1;
+            for (int j = 0; j < 16; j++) {
+                if (sb[j].size && v >= sb[j].addr && v < sb[j].addr + sb[j].size) known = 1;
+                if (!sb[j].size && free_slot < 0) free_slot = j;
+            }
+            VkMemSpan sp;
+            if (known || free_slot < 0 || !vk_mem_resolve(v, 16, &sp)) continue;
+            sb[free_slot] = (p_bind_buf){NVN_STAGE_CS, free_slot, v, sp.avail < PTR_SPAN ? sp.avail : PTR_SPAN};
+            added++;
+            static int logged;
+            if (logged++ < 8)
+                rt_log("vk_exec: pointer %#llx at %#llx+%#llx of storage slot %d bound to free slot %d for a dispatch (%llu bytes)",
+                       (unsigned long long)v, (unsigned long long)base, (unsigned long long)o, k, free_slot,
+                       (unsigned long long)sb[free_slot].size);
+        }
+    }
+    return added;
+}
+
+static void op_dispatch_body(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     {   // OOT_SKIP_DISPATCH_FROM=<n> (diagnostic): the n-th and later compute dispatches since boot are not recorded, to
@@ -2638,6 +2684,17 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
+}
+
+static void op_dispatch_body(VkExec *ex, const p_dispatch *d);
+static void op_dispatch_ind_body(VkExec *ex, const p_dispatch_ind *d);
+// A dispatch with the pointer targets of its storage buffers bound for it (ptr_targets_add), then the game's bindings.
+static void op_dispatch_ptr(VkExec *ex, const void *payload, int indirect) {
+    p_bind_buf saved[16];
+    int added = ptr_targets_add(ex, saved);
+    if (indirect) op_dispatch_ind_body(ex, payload);
+    else op_dispatch_body(ex, payload);
+    if (added) memcpy(ex->ssbo[NVN_STAGE_CS], saved, sizeof saved);
 }
 
 // OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible
@@ -2690,7 +2747,7 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
 
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
-static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
+static void op_dispatch_ind_body(VkExec *ex, const p_dispatch_ind *d) {
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &ip) || ip.offset % 4)
@@ -2918,10 +2975,10 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
     case OP_DRAW: op_draw(ex, payload); break;
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
-    case OP_DISPATCH: op_dispatch(ex, payload); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
+    case OP_DISPATCH: op_dispatch_ptr(ex, payload, 0); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DRAW_IND: op_draw_ind(ex, payload); break;
-    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); ex->push_cc_len = 0; break;
+    case OP_DISPATCH_IND: op_dispatch_ptr(ex, payload, 1); ex->push_cc_len = 0; break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }
