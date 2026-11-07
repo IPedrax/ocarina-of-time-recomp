@@ -46,6 +46,9 @@
 // table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
 // (MIT, tools/vendor/ryujinx).
 #include <io.h>
+// OOT_FENCE_TRACE (vk_sync.c's watchdog): mark the step the replay is in, so a stall names it
+void vk_trace_stage(int s);
+int vk_trace_enabled(void);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2858,6 +2861,7 @@ static void prebuild_start(void) {
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
+    vk_trace_stage(27);   // OOT_FENCE_TRACE: make_module
     VkShaderModule m = make_module(code, words);
     if (!m) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
@@ -2867,8 +2871,13 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
+    if (vk_trace_enabled())
+        rt_log("vk_pipeline: building a compute pipeline of %llu SPIR-V words (%.1f MB) under P.lock",
+               (unsigned long long)words, (double)words * 4.0 / 1048576.0);
+    vk_trace_stage(25);   // OOT_FENCE_TRACE: inside vkCreateComputePipelines (the driver compiles)
     double t0 = now_ms();
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    vk_trace_stage(26);   // OOT_FENCE_TRACE: the driver returned
     double ms = now_ms() - t0;
     if (ms > 100)   // the upscaler's kernels: tens of thousands of emulated tensor-core instructions each (docs/phase3.md)
         rt_log("vk_pipeline: a compute pipeline of %llu SPIR-V words took %.0f ms to build%s", (unsigned long long)words, ms,

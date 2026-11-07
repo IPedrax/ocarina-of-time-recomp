@@ -18,6 +18,9 @@
 // 9365-9488, 9489-9921, 10013-10079 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the uniform-buffer spans, texture and
 // sampler descriptor lookups and the dispatch flow follow LAS Recomp runtime/nvn/vulkan/exec.c:1851-1908, 2300-2516
 // @ da35b83a (MIT, Copyright (c) 2026 Peiikai). The support buffer layout is Ryujinx's SupportBuffer.cs (MIT).
+// OOT_FENCE_TRACE (vk_sync.c's watchdog): mark the step the replay is in, so a stall names it
+void vk_trace_stage(int s);
+
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -3035,6 +3038,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         if (skip_from == -2) { const char *e = getenv("OOT_SKIP_DISPATCH_FROM"); skip_from = e ? atoll(e) : -1; }
         if (skip_from >= 0 && count++ >= skip_from) return;
     }
+    // OOT_FENCE_TRACE: stage codes 20-25 name the step of a compute dispatch that does not return (vk_sync.c watchdog)
+    vk_trace_stage(20);   // shader_for: translate the program
     cb_res(ex);
     dummies_init();
     int present;
@@ -3050,21 +3055,26 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         return;
     }
     if (skip_cs(cs)) return;
+    vk_trace_stage(21);   // vk_pipeline_compute: the driver compiles the program here
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
+    vk_trace_stage(22);   // barrier: ends the pass
     vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     twin_dispatch = 1;
+    vk_trace_stage(23);   // descriptors
     bind_resources(ex, info);
     twin_dispatch = 0;
+    vk_trace_stage(24);   // push constants + record
     int tp = cst_begin(ex);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
     cr_after_dispatch(ex, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
+    vk_trace_stage(5);   // back to "recording this submission" (vk_sync_submit's own stage)
 }
 
 // OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible

@@ -65,6 +65,10 @@ static void ft_init(void) {
     }
 }
 static void ft_set(int stage) { if (ftrace > 0) __atomic_store_n(&ft_stage, stage, __ATOMIC_RELEASE); }
+
+// Exported so the replay can mark its own stages (vk_exec_draw.c op_dispatch): the innermost mark is what a stall needs.
+void vk_trace_stage(int s) { ft_set(s); }
+int vk_trace_enabled(void) { return ftrace > 0; }
 static volatile LONG64 ft_cstage;   // the completion thread's own stage: it polls the timeline every 100 ms and must not
                                     // overwrite the submit path's stage, which is what a stall needs to show
 static void ft_cset(int stage) { if (ftrace > 0) __atomic_store_n(&ft_cstage, stage, __ATOMIC_RELEASE); }
