@@ -1113,6 +1113,79 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     return a;
 }
 
+// OOT_CS_READBACK=<frame> (diagnostic, docs/mesh-tracker.md): from that frame on (512 copies) every dispatch copies the first 64 bytes of
+// each storage buffer it writes, right after it, into a host buffer; they are logged when the submission completed,
+// with the kernel's code hash, its group counts and the buffer's guest address. Reading them in order shows which
+// kernel of a chain produces nothing.
+#define CR_N 512
+static struct { int on, all; uint64_t frame, code; uint32_t dims[3]; int npend; struct { VkBuffer b; VkDeviceSize o, n; uint64_t addr; } pend[16];
+                VkBuffer buf; VmaAllocation alloc; const uint32_t *map; uint32_t used; } CR = {-1};
+typedef struct { uint32_t n; struct { uint32_t slot, words; uint64_t addr, code; uint32_t dim[3]; } e[64]; } CrDone;
+static int cr_active(void) {
+    if (CR.on < 0) {
+        const char *e = cfg_get("OOT_CS_READBACK");
+        CR.on = e && *e, CR.frame = CR.on ? strtoull(e, NULL, 10) : 0, CR.all = CR.on && strstr(e, ",all") != NULL;   // ,all: read ones too
+        const char *cc = CR.on ? strstr(e, ",code=") : NULL;   // ,code=<hex>: only that kernel (its code hash)
+        CR.code = cc ? strtoull(cc + 6, NULL, 16) : 0;
+        const char *dd = CR.on ? strstr(e, ",dims=") : NULL;   // ,dims=XxYxZ: only direct dispatches of that size
+        if (dd) sscanf(dd + 6, "%ux%ux%u", &CR.dims[0], &CR.dims[1], &CR.dims[2]);
+        if (CR.on) rt_log("vk_exec: OOT_CS_READBACK: the dispatches of frame %llu", (unsigned long long)CR.frame);
+    }
+    int on = CR.on && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= CR.frame && CR.used < CR_N;   // from the frame on
+    static int said;
+    if (on && !said) said = 1, rt_log("vk_exec: OOT_CS_READBACK: frame %llu reached", (unsigned long long)CR.frame);
+    return on;
+}
+static void cr_done(void *arg) {
+    CrDone *m = arg;
+    vmaInvalidateAllocation(vk_ctx()->vma, CR.alloc, 0, VK_WHOLE_SIZE);
+    for (uint32_t i = 0; i < m->n; i++) {
+        const uint32_t *w = CR.map + m->e[i].slot * 16;
+        char t[160] = "";
+        for (uint32_t k = 0; k < m->e[i].words && k < 16; k++) snprintf(t + strlen(t), sizeof t - strlen(t), " %08x", w[k]);
+        rt_log("vk_exec: readback: cs %016llx dispatch %ux%ux%u wrote %#llx:%s", (unsigned long long)m->e[i].code, m->e[i].dim[0],
+               m->e[i].dim[1], m->e[i].dim[2], (unsigned long long)m->e[i].addr, t);
+    }
+    free(m);
+}
+static uint64_t cs_code_hash(const VkExec *ex) {
+    const uint8_t *ctl, *code;
+    uint32_t len;
+    uint64_t h = 0xcbf29ce484222325ull;
+    if (ex->prog && vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len))
+        for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+    return h;
+}
+// After a dispatch: the copies of what it wrote (the barrier makes its writes visible to the copy).
+static void cr_after_dispatch(VkExec *ex, uint32_t x, uint32_t y, uint32_t z) {
+    if (!CR.npend) return;
+    static int said;
+    if (!said) said = 1, rt_log("vk_exec: OOT_CS_READBACK: the first written buffers copied");
+    VkCtx *c = vk_ctx();
+    if (!CR.buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64 * CR_N, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ra = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(c->vma, &bi, &ra, &CR.buf, &CR.alloc, &info) != VK_SUCCESS) rt_fatal("vk: readback buffer failed");
+        CR.map = info.pMappedData;
+    }
+    vk_exec_barrier(ex);
+    CrDone *m = calloc(1, sizeof *m);
+    if (!m) rt_fatal("vk: out of memory");
+    uint64_t code = cs_code_hash(ex);
+    for (int i = 0; i < CR.npend && CR.used < CR_N && m->n < 64; i++) {
+        VkDeviceSize n = CR.pend[i].n < 64 ? CR.pend[i].n : 64;
+        VkBufferCopy r = {CR.pend[i].o, 64 * (VkDeviceSize)CR.used, n};
+        vkCmdCopyBuffer(ex->cb, CR.pend[i].b, CR.buf, 1, &r);
+        m->e[m->n].slot = CR.used++, m->e[m->n].words = (uint32_t)(n / 4), m->e[m->n].addr = CR.pend[i].addr, m->e[m->n].code = code;
+        m->e[m->n].dim[0] = x, m->e[m->n].dim[1] = y, m->e[m->n].dim[2] = z, m->n++;
+    }
+    CR.npend = 0;
+    ex->recorded += m->n + 1;
+    vk_completion_add(ex->fence, cr_done, m);
+}
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
@@ -1132,6 +1205,11 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        written, &bi)) {
             if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range);
+            if ((written || CR.all) && st == NVN_STAGE_CS && bi.buffer != VK_NULL_HANDLE && CR.npend < 16 && cr_active() &&
+                (!CR.code || cs_code_hash(ex) == CR.code) &&
+                (!CR.dims[0] || (c0_dim[0] == CR.dims[0] && c0_dim[1] == CR.dims[1] && c0_dim[2] == CR.dims[2])))
+                CR.pend[CR.npend].b = bi.buffer, CR.pend[CR.npend].o = bi.offset + lead, CR.pend[CR.npend].n = bi.range - lead,
+                CR.pend[CR.npend].addr = b->addr, CR.npend++;
             return bi;
         }
         if (b->addr) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
@@ -2985,6 +3063,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
+    cr_after_dispatch(ex, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
 }
 
@@ -3182,6 +3261,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     ind_log(ex, &ip, cs);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     ex->recorded++;
+    cr_after_dispatch(ex, 0xffffffffu, 0, 0);   // indirect
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});

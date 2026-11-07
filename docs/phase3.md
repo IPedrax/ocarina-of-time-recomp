@@ -324,6 +324,21 @@ VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the 
 programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
 hand-off for it.
 
+## Status (2026-11-07): the level's frame rate is one kernel
+
+`OOT_CS_TIME=1` on the level route (run 398): one compute kernel, input id `ace1cec038d64d1f` (code hash
+`80fb2f9325762992`, 8x8 threads over 64x64 groups: one thread per pixel of a 512x512 target), takes 1578 ms of GPU
+time per dispatch, 99.9% of the frame's compute; everything else is below 0.4 ms. Skipping it
+(`OOT_SKIP_CS=1a62084a,ace1cec0`, run 405) takes the GPU from about 450 ms to 10.5 ms a frame: 58 fps in the first
+minute, the replay script reaches a cutscene (a Kokiri and Navi, textured and lit, `build/logs/level-noace.png`), the
+background dark. Its first loop (0x900-0xcf0) runs over 0x30-byte records of the storage buffer at bank 0 + 0x60
+(NVN2 table slot 0; in the dump `build/logs/dump-ace`, 0x18040 bytes: a 0x40-byte header and room for 2048
+records), sampling a texture each, up to the count at the buffer's + 4 (`LD R3, [UR4 + 0x4]`); later loops are
+bounded by word 0 of uniform blocks 4-7, zero in the dump. Two of its four textures resolve to the 4x4 default
+texture (bank 0 + 0x80, + 0x88). Next: the count it reads (the readback `OOT_CS_READBACK=<frame>,all,dims=64x64x1`
+did not catch its buffer, so it may not go through `ssbo_info`), and whether its record buffer and textures are the
+right ones. Until then, `OOT_SKIP_CS=1a62084a,ace1cec0` gives a playable frame rate on the level for testing.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
