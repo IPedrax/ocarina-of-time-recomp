@@ -1,0 +1,537 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -125,6 +125,12 @@
+             Add(Instruction.ShiftRightS32,            GenerateShiftRightS32);
+             Add(Instruction.ShiftRightU32,            GenerateShiftRightU32);
+             Add(Instruction.MatrixMultiplyAdd,        GenerateMatrixMultiplyAdd);
++            Add(Instruction.SetMeshOutputs,           GenerateSetMeshOutputs);
++            Add(Instruction.EmitMeshTasks,            GenerateEmitMeshTasks);
++            Add(Instruction.MeshStoreVertex,          GenerateMeshStoreVertex);
++            Add(Instruction.MeshStorePrimitive,       GenerateMeshStorePrimitive);
++            Add(Instruction.TaskPayloadLoad,          GenerateTaskPayloadLoad);
++            Add(Instruction.TaskPayloadStore,         GenerateTaskPayloadStore);
+             Add(Instruction.Shuffle,                  GenerateShuffle);
+             Add(Instruction.ShuffleDown,              GenerateShuffleDown);
+             Add(Instruction.ShuffleUp,                GenerateShuffleUp);
+@@ -515,6 +521,71 @@
+         private static OperationResult GenerateDivide(CodeGenContext context, AstOperation operation)
+         {
+             return GenerateBinary(context, operation, context.Delegates.FDiv, context.Delegates.SDiv);
++        }
++
++        // Task and mesh programs (InstEmitMesh.cs, MeshShader.cs; docs/mesh.md of ocarina-of-time-recomp).
++        private static OperationResult GenerateSetMeshOutputs(CodeGenContext context, AstOperation operation)
++        {
++            context.SetMeshOutputsEXT(context.GetU32(operation.GetSource(0)), context.GetU32(operation.GetSource(1)));
++
++            return OperationResult.Invalid;
++        }
++
++        // OpEmitMeshTasksEXT ends its block: what the program has after it (its return) goes into a new, unreachable one.
++        private static OperationResult GenerateEmitMeshTasks(CodeGenContext context, AstOperation operation)
++        {
++            SpvInstruction one = context.Constant(context.TypeU32(), 1);
++
++            context.EmitMeshTasksEXT(context.GetU32(operation.GetSource(0)), one, one, context.GetTaskPayload());
++            context.AddLabel(context.Label());
++
++            return OperationResult.Invalid;
++        }
++
++        // Sources: the output line's target (0-3 position x-w, 4 + location * 4 + component), the vertex, the value.
++        private static OperationResult GenerateMeshStoreVertex(CodeGenContext context, AstOperation operation)
++        {
++            int target = ((AstOperand)operation.GetSource(0)).Value;
++            SpvInstruction vertex = context.GetU32(operation.GetSource(1));
++            SpvInstruction value = context.BitcastIfNeeded(AggregateType.FP32, AggregateType.U32, context.GetU32(operation.GetSource(2)));
++            SpvInstruction variable = context.GetMeshOutput(target < 4 ? -1 : (target - 4) >> 2);
++            SpvInstruction component = context.Constant(context.TypeU32(), target < 4 ? target : (target - 4) & 3);
++            SpvInstruction pointer = context.AccessChain(context.TypePointer(StorageClass.Output, context.TypeFP32()), variable, vertex, component);
++
++            context.Store(pointer, value);
++
++            return OperationResult.Invalid;
++        }
++
++        private static OperationResult GenerateMeshStorePrimitive(CodeGenContext context, AstOperation operation)
++        {
++            SpvInstruction uvec3 = context.TypeVector(context.TypeU32(), 3);
++            SpvInstruction primitive = context.GetU32(operation.GetSource(0));
++            SpvInstruction value = context.CompositeConstruct(uvec3, context.GetU32(operation.GetSource(1)),
++                context.GetU32(operation.GetSource(2)), context.GetU32(operation.GetSource(3)));
++            SpvInstruction pointer = context.AccessChain(context.TypePointer(StorageClass.Output, uvec3), context.GetMeshPrimitiveIndices(), primitive);
++
++            context.Store(pointer, value);
++
++            return OperationResult.Invalid;
++        }
++
++        private static OperationResult GenerateTaskPayloadLoad(CodeGenContext context, AstOperation operation)
++        {
++            SpvInstruction pointer = context.AccessChain(context.TypePointer(StorageClass.TaskPayloadWorkgroupEXT, context.TypeU32()),
++                context.GetTaskPayload(), context.GetU32(operation.GetSource(0)));
++
++            return new OperationResult(AggregateType.U32, context.Load(context.TypeU32(), pointer));
++        }
++
++        private static OperationResult GenerateTaskPayloadStore(CodeGenContext context, AstOperation operation)
++        {
++            SpvInstruction pointer = context.AccessChain(context.TypePointer(StorageClass.TaskPayloadWorkgroupEXT, context.TypeU32()),
++                context.GetTaskPayload(), context.GetU32(operation.GetSource(0)));
++
++            context.Store(pointer, context.GetU32(operation.GetSource(1)));
++
++            return OperationResult.Invalid;
+         }
+ 
+         private static OperationResult GenerateEmitVertex(CodeGenContext context, AstOperation operation)
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/MeshShader.cs
+@@ -0,0 +1,83 @@
++using System.Collections.Generic;
++using static Spv.Specification;
++using SpvInstruction = Spv.Generator.Instruction;
++using SpvLiteralInteger = Spv.Generator.LiteralInteger;
++
++namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
++{
++    // Task and mesh programs of ocarina-of-time-recomp (docs/mesh.md; ShaderDefinitions.MeshStage): the output
++    // variables of a mesh entry point and the task payload, declared on first use. Mesh outputs are arrays over the
++    // maximum vertex (and primitive) count: the position (BuiltIn Position), one vec4 array per user output location,
++    // the triangle indices (BuiltIn PrimitiveTriangleIndicesEXT); the payload is a uint array in TaskPayloadWorkgroupEXT,
++    // the same declaration in the task and the mesh stage.
++    partial class CodeGenContext
++    {
++        private readonly Dictionary<int, SpvInstruction> _meshOutputs = new();
++        private SpvInstruction _meshPrimitiveIndices;
++        private SpvInstruction _taskPayload;
++
++        public void UseMeshShading()
++        {
++            AddCapability(Capability.MeshShadingEXT);
++            AddExtension("SPV_EXT_mesh_shader");
++        }
++
++        // location -1: the position.
++        public SpvInstruction GetMeshOutput(int location)
++        {
++            if (_meshOutputs.TryGetValue(location, out SpvInstruction variable))
++            {
++                return variable;
++            }
++
++            SpvInstruction vec4 = TypeVector(TypeFP32(), 4);
++            SpvInstruction array = TypeArray(vec4, Constant(TypeU32(), Definitions.MeshMaxVertices));
++            variable = Variable(TypePointer(StorageClass.Output, array), StorageClass.Output);
++            AddGlobalVariable(variable);
++
++            if (location < 0)
++            {
++                Decorate(variable, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.Position);
++                Name(variable, "mesh_position");
++            }
++            else
++            {
++                Decorate(variable, Decoration.Location, (SpvLiteralInteger)location);
++                Name(variable, $"mesh_out{location}");
++            }
++
++            _meshOutputs.Add(location, variable);
++
++            return variable;
++        }
++
++        public SpvInstruction GetMeshPrimitiveIndices()
++        {
++            if (_meshPrimitiveIndices == null)
++            {
++                SpvInstruction uvec3 = TypeVector(TypeU32(), 3);
++                SpvInstruction array = TypeArray(uvec3, Constant(TypeU32(), Definitions.MeshMaxPrimitives));
++                _meshPrimitiveIndices = Variable(TypePointer(StorageClass.Output, array), StorageClass.Output);
++                AddGlobalVariable(_meshPrimitiveIndices);
++                Decorate(_meshPrimitiveIndices, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.PrimitiveTriangleIndicesEXT);
++                Name(_meshPrimitiveIndices, "mesh_triangles");
++            }
++
++            return _meshPrimitiveIndices;
++        }
++
++        public SpvInstruction GetTaskPayload()
++        {
++            if (_taskPayload == null)
++            {
++                int words = Definitions.TaskPayloadWords > 0 ? Definitions.TaskPayloadWords : 1;
++                SpvInstruction array = TypeArray(TypeU32(), Constant(TypeU32(), words));
++                _taskPayload = Variable(TypePointer(StorageClass.TaskPayloadWorkgroupEXT, array), StorageClass.TaskPayloadWorkgroupEXT);
++                AddGlobalVariable(_taskPayload);
++                Name(_taskPayload, "task_payload");
++            }
++
++            return _taskPayload;
++        }
++    }
++}
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -190,7 +190,28 @@
+ 
+             if (funcIndex == 0)
+             {
+-                context.AddEntryPoint(context.Definitions.Stage.Convert(), spvFunc, "main", context.GetMainInterface());
++                if (context.Definitions.MeshStage != 0)
++                {
++                    // A task or mesh program translated as compute (docs/mesh.md of ocarina-of-time-recomp): SPIR-V 1.4,
++                    // which SPV_EXT_mesh_shader needs and where the interface lists every global variable; the compute
++                    // branch below still adds LocalSize.
++                    bool mesh = context.Definitions.MeshStage == 2;
++
++                    context.UseMeshShading();
++                    context.SetVersion(0x10400);
++                    context.AddEntryPoint(mesh ? ExecutionModel.MeshEXT : ExecutionModel.TaskEXT, spvFunc, "main", context.GlobalVariables());
++
++                    if (mesh)
++                    {
++                        context.AddExecutionMode(spvFunc, ExecutionMode.OutputVertices, (SpvLiteralInteger)context.Definitions.MeshMaxVertices);
++                        context.AddExecutionMode(spvFunc, ExecutionMode.OutputPrimitivesEXT, (SpvLiteralInteger)context.Definitions.MeshMaxPrimitives);
++                        context.AddExecutionMode(spvFunc, ExecutionMode.OutputTrianglesEXT);
++                    }
++                }
++                else
++                {
++                    context.AddEntryPoint(context.Definitions.Stage.Convert(), spvFunc, "main", context.GetMainInterface());
++                }
+ 
+                 if (context.Definitions.Stage == ShaderStage.TessellationControl)
+                 {
+--- a/src/Ryujinx.Graphics.Shader/Decoders/Decoder.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/Decoder.cs
+@@ -308,6 +308,8 @@
+                     case InstName.AtomsCas:
+                     case InstName.Lds:
+                     case InstName.Sts:
++                    case InstName.Isbe:
++                    case InstName.MeshEpilogue:
+                         context.SetUsedFeature(FeatureFlags.SharedMemory);
+                         break;
+                     case InstName.Atom:
+--- a/src/Ryujinx.Graphics.Shader/Decoders/InstName.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/InstName.cs
+@@ -185,5 +185,7 @@
+         Vshr,
+         Xmad,
+         Mma,
++        Isbe,
++        MeshEpilogue,
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/Decoders/InstTable.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/InstTable.cs
+@@ -266,6 +266,10 @@
+             // Not a Maxwell instruction: ocarina-of-time-recomp's SM86 lowering (runtime/sm86_lower.c lower_hmma) marks an
+             // HMMA.16816.F16 with this encoding: Rd 0-7, Ra 8-15 (four registers), Rb 20-27 (two), Rc 39-46 (two).
+             Add("111101111111xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Mma,         InstEmit.Mma,         InstProps.Rd  | InstProps.Ra  | InstProps.Rb  | InstProps.Rc);
++            // Not Maxwell instructions: ocarina-of-time-recomp's SM86 lowering (runtime/sm86_lower.h SM86_ISBE_OP,
++            // SM86_MESH_EPILOGUE) passes the stage buffer ops of task and mesh programs and the end every EXIT branches to.
++            Add("01101100xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Isbe,        InstEmit.Isbe,        InstProps.Rd  | InstProps.Ra);
++            Add("01101101xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.MeshEpilogue, InstEmit.MeshEpilogue, InstProps.None);
+             Add("1110111100010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Shfl,        InstEmit.Shfl,        InstProps.Rd  | InstProps.Ra  | InstProps.Rb  | InstProps.Rc  | InstProps.LPd);
+             Add("0101110001001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Shl,         InstEmit.ShlR,        InstProps.Rd  | InstProps.Ra  | InstProps.Rb);
+             Add("0011100x01001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Shl,         InstEmit.ShlI,        InstProps.Rd  | InstProps.Ra  | InstProps.Ib);
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -340,6 +340,18 @@
+         {
+             return false;
+         }
++
++        // Task and mesh programs (ocarina-of-time-recomp, docs/mesh.md): translated as compute (TranslationFlags.Compute)
++        // with these answers, which make the SPIR-V a TaskEXT or MeshEXT entry point. Stage: 0 neither, 1 task, 2 mesh.
++        // Output line k (a vertex output component in the stage buffer): 0-3 position x-w, 4 + location * 4 +
++        // component a user output, -1 none. The stage buffer lives in shared memory from QueryMeshBufferBase (bytes).
++        int QueryMeshStage() => 0;
++        int QueryMeshMaxVertices() => 0;
++        int QueryMeshMaxPrimitives() => 0;
++        int QueryMeshOutputLines() => 0;
++        int QueryMeshOutputLine(int line) => -1;
++        int QueryMeshBufferBase() => 0;
++        int QueryTaskPayloadWords() => 0;
+ 
+         /// <summary>
+         /// Queries host GPU support for signed normalized buffer texture formats.
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
+@@ -0,0 +1,160 @@
++using Ryujinx.Graphics.Shader.Decoders;
++using Ryujinx.Graphics.Shader.IntermediateRepresentation;
++using Ryujinx.Graphics.Shader.Translation;
++using static Ryujinx.Graphics.Shader.Instructions.InstEmitHelper;
++using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
++
++namespace Ryujinx.Graphics.Shader.Instructions
++{
++    // Task and mesh programs of ocarina-of-time-recomp (docs/mesh.md), translated as compute. The SM86 lowering passes
++    // their stage buffer ops (ISBERD / ISBEWR) as Isbe and marks the end every EXIT branches to with MeshEpilogue
++    // (runtime/sm86_lower.h). The stage buffer is emulated in shared memory from ShaderDefinitions.MeshBufferBase:
++    //   mesh: the vertex outputs (ATTR) at 0, one 0x80-byte line per output component and group of 32 vertices
++    //         (vertex v's line k at (v >> 5) * lines * 0x80 + k * 0x80 + (v & 31) * 4), then the primitive map (MAP):
++    //         its count word, then three index bytes per triangle from byte 4;
++    //   task: the task's output (TASK): the mesh workgroup count at 4, the payload from 0x10.
++    // The epilogue copies the buffer into the stage's outputs (MeshStoreVertex, MeshStorePrimitive, SetMeshOutputs) or
++    // the payload into the task payload and launches the mesh workgroups (TaskPayloadStore, EmitMeshTasks), with no
++    // control flow: every vertex slot is written, and primitives past the count get the degenerate triangle 0, 0, 0.
++    static partial class InstEmit
++    {
++        private const int SpaceAttr = 0xf, SpaceTask = 7, SpaceMap32 = 1, SpaceMapU8 = 0;
++
++        private static int MeshAttrBytes(ShaderDefinitions d)
++        {
++            return d.MeshMaxVertices * d.MeshOutputLines.Length * 4;
++        }
++
++        // Isbe: bits 0-7 the register read into or written, 8-15 the address register, 20-43 the byte offset, 44-47
++        // the space, 48 a write.
++        public static void Isbe(EmitterContext context)
++        {
++            ulong op = context.CurrOp.RawOpCode;
++            int reg = (int)(op & 0xff), ra = (int)((op >> 8) & 0xff);
++            int offset = (int)((op >> 20) & 0xffffff), space = (int)((op >> 44) & 0xf);
++            bool write = ((op >> 48) & 1) != 0;
++            ShaderDefinitions d = context.TranslatorContext.Definitions;
++            int id = context.ResourceManager.SharedMemoryId;
++            bool rz = ra == RegisterConsts.RegisterZeroIndex;
++            Operand addr = rz ? Const(offset) : context.IAdd(GetSrcReg(context, ra), Const(offset));
++
++            if (!write)
++            {
++                Operand value;
++
++                if ((space == SpaceAttr || space == SpaceTask) && rz && offset == 0)
++                {
++                    value = context.Load(StorageKind.Input, IoVariable.CtaId, null, Const(0));   // the workgroup index
++                }
++                else if (space == SpaceTask && d.MeshStage == 2)
++                {
++                    Operand index = context.ShiftRightU32(context.ISubtract(addr, Const(0x10)), Const(2));
++                    value = context.Add(Instruction.TaskPayloadLoad, Local(), index);
++                }
++                else
++                {
++                    context.TranslatorContext.GpuAccessor.Log($"ISBERD of space {space:x} at {offset:x}: read as 0");
++                    value = Const(0);
++                }
++
++                context.Copy(GetDest(reg), value);
++                return;
++            }
++
++            Operand data = GetSrcReg(context, reg);
++            int baseBytes = d.MeshBufferBase;
++
++            switch (space)
++            {
++                case SpaceAttr when d.MeshStage == 2:
++                    context.Store(StorageKind.SharedMemory, id, context.ShiftRightU32(context.IAdd(addr, Const(baseBytes)), Const(2)), data);
++                    break;
++                case SpaceMapU8 when d.MeshStage == 2:
++                    context.Store(StorageKind.SharedMemory8, id, context.IAdd(addr, Const(baseBytes + MeshAttrBytes(d))), data);
++                    break;
++                case SpaceMap32 when d.MeshStage == 2 && rz && offset == 3:
++                    context.Store(StorageKind.SharedMemory, id, Const((baseBytes + MeshAttrBytes(d)) >> 2), data);   // the count
++                    break;
++                case SpaceTask when d.MeshStage == 1:
++                    context.Store(StorageKind.SharedMemory, id, context.ShiftRightU32(context.IAdd(addr, Const(baseBytes)), Const(2)), data);
++                    break;
++                default:
++                    context.TranslatorContext.GpuAccessor.Log($"ISBEWR of space {space:x} at {offset:x} in mesh stage {d.MeshStage}: dropped");
++                    break;
++            }
++        }
++
++        public static void MeshEpilogue(EmitterContext context)
++        {
++            ShaderDefinitions d = context.TranslatorContext.Definitions;
++            int id = context.ResourceManager.SharedMemoryId;
++
++            context.Barrier();
++
++            Operand tid = context.Load(StorageKind.Input, IoVariable.ThreadId, null, Const(0));
++
++            if (d.MeshStage == 2)
++            {
++                int lines = d.MeshOutputLines.Length;
++                int mapBase = d.MeshBufferBase + MeshAttrBytes(d);
++                Operand count = context.Load(StorageKind.SharedMemory, id, Const(mapBase >> 2));
++                Operand t4 = context.ShiftLeft(tid, Const(2));
++
++                context.Add(Instruction.SetMeshOutputs, null, Const(d.MeshMaxVertices), Const(d.MeshMaxPrimitives));
++
++                for (int j = 0; j < d.MeshMaxVertices / 32; j++)
++                {
++                    Operand v = context.IAdd(tid, Const(32 * j));
++
++                    for (int k = 0; k < lines; k++)
++                    {
++                        if (d.MeshOutputLines[k] < 0)
++                        {
++                            continue;
++                        }
++
++                        Operand byteAddr = context.IAdd(t4, Const(d.MeshBufferBase + j * lines * 0x80 + k * 0x80));
++                        Operand value = context.Load(StorageKind.SharedMemory, id, context.ShiftRightU32(byteAddr, Const(2)));
++
++                        context.Add(Instruction.MeshStoreVertex, null, Const(d.MeshOutputLines[k]), v, value);
++                    }
++                }
++
++                for (int j = 0; j < d.MeshMaxPrimitives / 32; j++)
++                {
++                    Operand p = context.IAdd(tid, Const(32 * j));
++                    Operand valid = context.ICompareLessUnsigned(p, count);
++                    Operand first = context.IAdd(context.IMultiply(p, Const(3)), Const(mapBase + 4));
++                    Operand[] index = new Operand[3];
++
++                    for (int i = 0; i < 3; i++)
++                    {
++                        Operand b = context.IAdd(first, Const(i));
++                        Operand word = context.Load(StorageKind.SharedMemory, id, context.ShiftRightU32(b, Const(2)));
++                        Operand shift = context.ShiftLeft(context.BitwiseAnd(b, Const(3)), Const(3));
++                        Operand value = context.BitwiseAnd(context.ShiftRightU32(word, shift), Const(0xff));
++
++                        index[i] = context.ConditionalSelect(valid, value, Const(0));
++                    }
++
++                    context.Add(Instruction.MeshStorePrimitive, null, p, index[0], index[1], index[2]);
++                }
++            }
++            else if (d.MeshStage == 1)
++            {
++                Operand count = context.Load(StorageKind.SharedMemory, id, Const((d.MeshBufferBase + 4) >> 2));
++
++                for (int j = 0; j < d.TaskPayloadWords / 32; j++)
++                {
++                    Operand w = context.IAdd(tid, Const(32 * j));
++                    Operand value = context.Load(StorageKind.SharedMemory, id, context.IAdd(w, Const((d.MeshBufferBase + 0x10) >> 2)));
++
++                    context.Add(Instruction.TaskPayloadStore, null, w, value);
++                }
++
++                context.Barrier();
++                context.Add(Instruction.EmitMeshTasks, null, count);
++            }
++        }
++    }
++}
+--- a/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/Instruction.cs
++++ b/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/Instruction.cs
+@@ -126,6 +126,12 @@
+         VoteAllEqual,
+         VoteAny,
+         MatrixMultiplyAdd,
++        SetMeshOutputs,
++        EmitMeshTasks,
++        MeshStoreVertex,
++        MeshStorePrimitive,
++        TaskPayloadLoad,
++        TaskPayloadStore,
+ 
+         Count,
+ 
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+@@ -115,6 +115,12 @@
+             Add(Instruction.ShiftRightS32,            AggregateType.S32,    AggregateType.S32,     AggregateType.S32);
+             Add(Instruction.ShiftRightU32,            AggregateType.U32,    AggregateType.U32,     AggregateType.S32);
+             Add(Instruction.MatrixMultiplyAdd,        AggregateType.U32,    AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32);
++            Add(Instruction.SetMeshOutputs,           AggregateType.Void,   AggregateType.U32,     AggregateType.U32);
++            Add(Instruction.EmitMeshTasks,            AggregateType.Void,   AggregateType.U32);
++            Add(Instruction.MeshStoreVertex,          AggregateType.Void,   AggregateType.S32,     AggregateType.U32,     AggregateType.U32);
++            Add(Instruction.MeshStorePrimitive,       AggregateType.Void,   AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32);
++            Add(Instruction.TaskPayloadLoad,          AggregateType.U32,    AggregateType.U32);
++            Add(Instruction.TaskPayloadStore,         AggregateType.Void,   AggregateType.U32,     AggregateType.U32);
+             Add(Instruction.Shuffle,                  AggregateType.FP32,   AggregateType.FP32,    AggregateType.U32);
+             Add(Instruction.ShuffleDown,              AggregateType.FP32,   AggregateType.FP32,    AggregateType.U32);
+             Add(Instruction.ShuffleUp,                AggregateType.FP32,   AggregateType.FP32,    AggregateType.U32);
+--- a/src/Ryujinx.Graphics.Shader/Translation/ShaderDefinitions.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ShaderDefinitions.cs
+@@ -12,6 +12,14 @@
+         public ShaderStage Stage { get; }
+ 
+         public int ComputeLocalSizeX { get; }
++
++        // Task and mesh programs translated as compute (IGpuAccessor.QueryMeshStage and the rest; docs/mesh.md).
++        public int MeshStage { get; set; }
++        public int MeshMaxVertices { get; set; }
++        public int MeshMaxPrimitives { get; set; }
++        public int[] MeshOutputLines { get; set; } = [];
++        public int MeshBufferBase { get; set; }
++        public int TaskPayloadWords { get; set; }
+         public int ComputeLocalSizeY { get; }
+         public int ComputeLocalSizeZ { get; }
+ 
+--- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
+@@ -69,11 +69,32 @@
+ 
+         private static ShaderDefinitions CreateComputeDefinitions(IGpuAccessor gpuAccessor)
+         {
+-            return new ShaderDefinitions(
++            ShaderDefinitions definitions = new ShaderDefinitions(
+                 ShaderStage.Compute,
+                 gpuAccessor.QueryComputeLocalSizeX(),
+                 gpuAccessor.QueryComputeLocalSizeY(),
+                 gpuAccessor.QueryComputeLocalSizeZ());
++
++            definitions.MeshStage = gpuAccessor.QueryMeshStage();
++
++            if (definitions.MeshStage != 0)
++            {
++                int lines = gpuAccessor.QueryMeshOutputLines();
++                int[] map = new int[lines];
++
++                for (int k = 0; k < lines; k++)
++                {
++                    map[k] = gpuAccessor.QueryMeshOutputLine(k);
++                }
++
++                definitions.MeshMaxVertices = gpuAccessor.QueryMeshMaxVertices();
++                definitions.MeshMaxPrimitives = gpuAccessor.QueryMeshMaxPrimitives();
++                definitions.MeshOutputLines = map;
++                definitions.MeshBufferBase = gpuAccessor.QueryMeshBufferBase();
++                definitions.TaskPayloadWords = gpuAccessor.QueryTaskPayloadWords();
++            }
++
++            return definitions;
+         }
+ 
+         private static ShaderDefinitions CreateGraphicsDefinitions(IGpuAccessor gpuAccessor, ShaderHeader header)
+--- /dev/null
++++ b/src/Spv.Generator/MeshShaderExt.cs
+@@ -0,0 +1,17 @@
++namespace Spv.Generator
++{
++    // For ocarina-of-time-recomp's task and mesh programs (docs/mesh.md): SPV_EXT_mesh_shader needs SPIR-V 1.4, whose
++    // entry points list every global variable they use, so the version is set per module and the globals are listed.
++    public partial class Module
++    {
++        public void SetVersion(uint version)
++        {
++            _version = version;
++        }
++
++        public Instruction[] GlobalVariables()
++        {
++            return _globals.ToArray();
++        }
++    }
++}
+--- a/src/Spv.Generator/Module.cs
++++ b/src/Spv.Generator/Module.cs
+@@ -11,7 +11,7 @@
+         // TODO: Register on SPIR-V registry.
+         private const int GeneratorId = 0;
+ 
+-        private readonly uint _version;
++        private uint _version;
+ 
+         private uint _bound;
+ 

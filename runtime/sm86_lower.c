@@ -3033,10 +3033,12 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
     }
     L l = {0};
     l.stage = c.stage;
-    l.graphics = c.stage != 5;
+    // Task and mesh programs are translated as compute (docs/mesh.md): no header in the output, addresses from 0; their
+    // input still has the SM86 header.
+    l.graphics = c.stage != 5 && c.stage != 6 && c.stage != 7;
     l.tensor = tensor && !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0;
     l.control = control, l.ctl_size = c.size, l.c1 = code + c.c1_off, l.c1_len = c.c1_len;
-    uint32_t header = l.graphics ? SM86_HEADER : 0;
+    uint32_t header = c.stage == 5 ? 0 : SM86_HEADER;
     l.in = (const Insn *)(code + header);
     l.n = (c.code_end - header) / 16;
     if (l.n == 0 || l.n > 65536) { snprintf(out->error, sizeof out->error, "program size"); return 0; }

@@ -25,6 +25,12 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
   `NX2_NOTES.md` row 89.
 - First version: monolithic mesh pipelines (no graphics pipeline library), task and mesh shaders kept out of the
   pipeline-key prewarm until they work.
+- C (2026-11-07): task and mesh programs are translated as compute with `ShaderDefinitions.MeshStage` set; only the
+  SPIR-V back end makes them TaskEXT / MeshEXT entry points (SPIR-V 1.4, every global in the interface, storage
+  buffers as StorageBuffer + Block). The stage buffer is shared memory after the program's own
+  (`QueryMeshBufferBase`): mesh ATTR lines then the primitive map; task TASK area (count at 4, payload from 0x10). The
+  epilogue has no control flow: SetMeshOutputs(maxV, maxP), every vertex slot written, primitives past the count get
+  the degenerate triangle 0, 0, 0. The lowering emits task and mesh programs without a graphics header (as compute).
 - B2 (2026-11-07): ISBERD/ISBEWR pass through the lowering as one pseudo instruction, `SM86_ISBE_OP` (top byte 0x6c,
   every field kept: register, address register, offset, space, read or write; `runtime/sm86_lower.h`), and every EXIT
   branches to `SM86_MESH_EPILOGUE` (0x6d). Not shared-memory ops: what a space means depends on the stage (a TASK
@@ -57,9 +63,9 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
 
 | ID | Task | Depends | Status | Done when |
 |---|---|---|---|---|
-| C1 | Add task and mesh stages to Ryujinx's `ShaderStage` and the translator's stage plumbing (`TranslatorContext`, `ShaderDefinitions`, attribute handling), and to `tools/xlate/Program.cs` job fields (stage `ts`/`ms`, workgroup size, max vertices/primitives, output map). | B3 | todo | A task and a mesh program translate without exceptions (output may still be wrong). |
-| C2 | SPIR-V back end: `TaskEXT`/`MeshEXT` execution models, `SPV_EXT_mesh_shader`, `MeshShadingEXT` capability, `OutputVertices`/`OutputPrimitivesEXT`/`OutputTrianglesEXT` and `LocalSize`, the task payload (`TaskPayloadWorkgroupEXT`), per-vertex and per-primitive output arrays, `PrimitiveTriangleIndicesEXT`. | C1 | todo | `spirv-val --target-env vulkan1.3` passes on every captured task and mesh program (`tools/kernel.py xlate`). |
-| C3 | The epilogue: for task, `OpEmitMeshTasksEXT` with the count and payload from the emulated buffer; for mesh, `OpSetMeshOutputsEXT` with the counts, then the copy of positions, attributes and indices from the buffer into the output arrays (layout from A3). | C2, B3 | todo | One mesh program run on hand-made inputs (`--probe-cs`-style probe for mesh, see D4) produces the expected triangles. |
+| C1 | Add task and mesh stages to Ryujinx's `ShaderStage` and the translator's stage plumbing (`TranslatorContext`, `ShaderDefinitions`, attribute handling), and to `tools/xlate/Program.cs` job fields (stage `ts`/`ms`, workgroup size, max vertices/primitives, output map). | B3 | done (2026-11-07): translator patches 0019 (Spv.Generator: the EXT enums, OpEmitMeshTasksEXT, OpSetMeshOutputsEXT), 0020 (task and mesh as compute), 0021 (storage buffers in SPIR-V 1.4); jobs `ts` / `ms` with a `mesh` object (`tools/xlate/Program.cs`) | A task and a mesh program translate without exceptions (output may still be wrong). |
+| C2 | SPIR-V back end: `TaskEXT`/`MeshEXT` execution models, `SPV_EXT_mesh_shader`, `MeshShadingEXT` capability, `OutputVertices`/`OutputPrimitivesEXT`/`OutputTrianglesEXT` and `LocalSize`, the task payload (`TaskPayloadWorkgroupEXT`), per-vertex and per-primitive output arrays, `PrimitiveTriangleIndicesEXT`. | C1 | done (2026-11-07): all 34 captured stages that lower translate and pass `spirv-val --target-env vulkan1.3` (MeshEXT / TaskEXT, SPIR-V 1.4) | `spirv-val --target-env vulkan1.3` passes on every captured task and mesh program (`tools/kernel.py xlate`). |
+| C3 | The epilogue: for task, `OpEmitMeshTasksEXT` with the count and payload from the emulated buffer; for mesh, `OpSetMeshOutputsEXT` with the counts, then the copy of positions, attributes and indices from the buffer into the output arrays (layout from A3). | C2, B3 | doing: the epilogue is in (InstEmitMesh.cs MeshEpilogue, straight-line); the output is to be checked on the GPU (D4) | One mesh program run on hand-made inputs (`--probe-cs`-style probe for mesh, see D4) produces the expected triangles. |
 | C4 | Fragment shaders paired with mesh programs: their inputs come from the mesh's per-vertex outputs (and per-primitive ones, `PerPrimitiveEXT`); check the location mapping against the mesh output map. | C2 | todo | The fragment shaders of the captures validate linked with their mesh shader (a pipeline builds, D2). |
 
 ### Phase D: host
@@ -144,3 +150,7 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   predicates as bits) is lowered too, which five mesh stages of task pipelines use. No regression over the stored
   inputs (530) and the refused programs that lowered before (608). KEY_VERSION 17. Next: B4 (stored inputs of task
   and mesh programs) needs the stages translated on demand, so C1 comes first.
+- 2026-11-07: C1, C2 done. The test script that lowers and translates the captures builds the job's `mesh` object
+  from the code header's output map (from byte 0x34: system values A, B (position = bits 4-7), a nibble per generic
+  vector) and the control section (+0x60 maxima, +0x58 payload); the host must do the same (D2). Next: D2 (mesh
+  pipelines and the job fields in `gfx_shader.c`), then D3/D4.

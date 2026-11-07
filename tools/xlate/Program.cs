@@ -69,6 +69,19 @@ static class SwshXlate
         public bool QueryHostSupportsShaderNonUniformIndexing() => false;
         // The translator's own messages (an unresolved bindless handle, for one) go into the .res.json notes.
         public void Log(string message) => Notes.Add(message);
+        // Task ("ts") and mesh ("ms") programs, translated as compute (docs/mesh.md): the job's "mesh" object carries
+        // what the program header and control section said (runtime/gfx_shader.c): "max_vertices", "max_primitives",
+        // "lines" (each output line's target: 0-3 position x-w, 4 + location * 4 + component, -1 none), "base" (the
+        // stage buffer's byte offset in shared memory, "shared" covering it), "payload_words".
+        JsonObject Mesh => _job["mesh"] as JsonObject;
+        int MeshInt(string name) => Mesh?[name] is JsonNode n ? (int)n : 0;
+        public int QueryMeshStage() => (string)_job["stage"] == "ts" ? 1 : (string)_job["stage"] == "ms" ? 2 : 0;
+        public int QueryMeshMaxVertices() => MeshInt("max_vertices");
+        public int QueryMeshMaxPrimitives() => MeshInt("max_primitives");
+        public int QueryMeshOutputLines() => Mesh?["lines"] is JsonArray a ? a.Count : 0;
+        public int QueryMeshOutputLine(int line) => Mesh?["lines"] is JsonArray a && line < a.Count ? (int)a[line] : -1;
+        public int QueryMeshBufferBase() => MeshInt("base");
+        public int QueryTaskPayloadWords() => MeshInt("payload_words");
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
         // 槽号 | the host's c2 slot of a handle (gfx_shader.c handle_slot): combined texture+sampler handles at bytes
@@ -168,7 +181,7 @@ static class SwshXlate
                 var acc = new Accessor(code, job);
                 // 作业 debug = false：关 DebugMode（DebugMode 会跳过 AST 优化器，产物满是临时变量；不改语义）
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
-                var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
+                var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] is "cs" or "ts" or "ms" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), p.BinaryCode);
