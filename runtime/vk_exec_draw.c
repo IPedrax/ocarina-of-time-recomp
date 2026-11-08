@@ -115,14 +115,14 @@ static struct {
     VkBuffer sup_buf;
     VkDeviceSize sup_off;
     int sup_valid;
-    uint8_t c0[3][VK_C0_BYTES];          // last c0 bank per stage (vertex, fragment, compute) and where it lives
-    VkBuffer c0_buf[3];
-    VkDeviceSize c0_off[3];
-    int c0_valid[3];
-    VkBuffer c1_buf[3];                 // the lowered constant bank 1 of the shader c1_of[k] (OoT, ubo_info)
-    VkDeviceSize c1_off[3], c1_size[3];
-    const GfxShader *c1_of[3];
-    struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[3];   // what vk_c0_fill read for c0[k]
+    uint8_t c0[5][VK_C0_BYTES];          // last c0 bank per stage (bank_k: vertex, fragment, compute, task, mesh)
+    VkBuffer c0_buf[5];                  // and where it lives
+    VkDeviceSize c0_off[5];
+    int c0_valid[5];
+    VkBuffer c1_buf[5];                 // the lowered constant bank 1 of the shader c1_of[k] (OoT, ubo_info)
+    VkDeviceSize c1_off[5], c1_size[5];
+    const GfxShader *c1_of[5];
+    struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[5];   // what vk_c0_fill read for c0[k]
     VkPipelineLayout ds_layout;          // graphics layout the sets below were last pushed or bound with
     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
@@ -893,14 +893,22 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // 16 bytes at 0x110 (vertex), 0x510 (fragment), 0x310 (compute): Ryujinx's GlobalToStorage fallback loads each
 // candidate base from here and compares the global pointer against it. Compute: dispatch size at 0x200, the uniform
 // buffer table at 0x210 + 16 r. Graphics: the largest point size (Maxwell's limit, GLSLC clamps gl_PointSize to it) at
-// 0x610, the base instance at 0x644. Other stages: zeros. Unbound slots read zero, since the replay keeps them zero.
-// Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
+// 0x610, the base instance at 0x644. NVN2's task and mesh stages: their storage tables at 0x670 and 0x770, nothing
+// else (2026-11-07, from Hookshot's gpu/vk/vk_bank.cpp driver_bank_word, read for behaviour only: the game's task
+// programs read storage slot 0 there, and with it null they find nothing to draw). Other stages: zeros. Unbound slots
+// read zero, since the replay keeps them zero. Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
+static int c0_ssbo_base(int st) {   // where c0 holds a stage's storage-buffer table; -1: none
+    return st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 : st == NVN_STAGE_CS ? 0x310
+         : st == NVN_STAGE_TS ? 0x670 : st == NVN_STAGE_MS ? 0x770 : -1;
+}
+
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     memset(bank, 0, VK_C0_BYTES);
-    int base = stage == NVN_STAGE_VS ? 0x110 : stage == NVN_STAGE_FS ? 0x510 : stage == NVN_STAGE_CS ? 0x310 : -1;
+    int base = c0_ssbo_base(stage);
     if (base < 0) return;
     c0_table(bank + base, ssbo);
+    if (stage == NVN_STAGE_TS || stage == NVN_STAGE_MS) return;
     if (stage == NVN_STAGE_CS) {
         memcpy(bank + 0x200, dispatch, 12);
         c0_table(bank + 0x210, ubo);
@@ -982,8 +990,12 @@ static int nvn2_cs(const VkExec *ex, int st) {   // an SM86 compute program is b
 }
 
 // c0 from replay scratch; a bank equal to the stage's previous one reuses its range, so it costs no copy.
+static int bank_k(int st) {   // the per-stage bank caches' index
+    return st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : st == NVN_STAGE_TS ? 3 : st == NVN_STAGE_MS ? 4 : 2;
+}
+
 static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
-    int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
+    int k = bank_k(st);
     // vk_c0_fill reads the storage slots, and the uniform slots and dispatch size for compute or the base instance for
     // graphics: equal inputs give the same bank, so neither the fill nor the 2 KiB compare is needed.
     typeof(B.c0_in[0]) in;
@@ -1028,7 +1040,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t n = 0;
         const uint8_t *c1 = s ? gfx_shader_c1(s, &n) : NULL;
         if (c1 && n) {
-            int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
+            int k = bank_k(st);
             if (B.c1_of[k] != s || !B.c1_buf[k]) {
                 uint64_t size = (n + 255) & ~255ull;
                 uint8_t *dst = scratch(ex, size, &B.c1_buf[k], &B.c1_off[k]);
@@ -1050,14 +1062,15 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
 
 // The NVN slot of a storage binding. Ryujinx numbers a shader's storage buffers in the order it meets them
 // (GfxShaderRes.slot); the NVN slot is the entry of the driver constant buffer c0 that holds the buffer's address
-// (cbuf_slot 0, handle = word offset): 16-byte entries at byte 0x110 (vertex), 0x510 (fragment) and 0x310 (compute).
+// (cbuf_slot 0, handle = word offset): 16-byte entries at byte 0x110 (vertex), 0x510 (fragment), 0x310 (compute),
+// 0x670 (task) and 0x770 (mesh).
 // A compute address at c0 0x210..0x30f is uniform block (offset - 0x210) / 16 read as storage: *ubo is set. -1: the
 // address is not in c0 (the shader loads it from a user uniform block: ubo_ptr) or the stage has no known table.
 // Mapping: MacNativeGames games/totk/tools/totk_xlate/Service.cs:206-222 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou).
 static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     *ubo = 0;
     if (r->cbuf_slot != 0) return -1;
-    int off = r->handle * 4, base = st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 : st == NVN_STAGE_CS ? 0x310 : -1;
+    int off = r->handle * 4, base = c0_ssbo_base(st);
     if (st == NVN_STAGE_CS && off >= 0x210 && off < 0x310 && (off - 0x210) % 16 == 0) {
         *ubo = 1;
         return (off - 0x210) / 16;
