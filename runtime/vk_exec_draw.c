@@ -1030,6 +1030,7 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     // table at 0x310 for the base of a global pointer it could not trace to a constant (the kernels' stores through
     // the address at bank 0 + 0x10), and the uniform table at 0x210 for the blocks read as storage.
     c0_table(bank + 0x310, ex->ssbo[NVN_STAGE_CS]);
+    c0_table(bank + 0x410, ex->ssbo[NVN_STAGE_CS] + 16);   // the pointer targets past the game's slots (patch 0025)
     c0_table(bank + 0x210, ex->ubo[NVN_STAGE_CS]);
 }
 
@@ -1141,7 +1142,8 @@ static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
         *ubo = 1;
         return (off - 0x210) / 16;
     }
-    return base >= 0 && off >= base && off < base + 0x100 && (off - base) % 16 == 0 ? (off - base) / 16 : -1;
+    int span = st == NVN_STAGE_CS ? 0x200 : 0x100;   // compute: 32 entries, the last 16 pointer targets (patch 0025)
+    return base >= 0 && off >= base && off < base + span && (off - base) % 16 == 0 ? (off - base) / 16 : -1;
 }
 
 // 1 when the shader loads the storage buffer's address from a user uniform block (cbuf_slot 3.., NVN uniform slot
@@ -1275,10 +1277,10 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     // A pointer target is bound for reading: the storage-table fallback (translator patch 0022) marks every slot of a
     // kernel written as soon as one store goes through it, and a write-back of each target per dispatch cost the
     // level's frames most of a second of replay (2026-11-07).
-    if (st >= 0 && st < NVN_STAGES && !ubo && slot >= 0 && slot < 16 && (ptr_slots[st] >> slot & 1)) written = 0;
+    if (st >= 0 && st < NVN_STAGES && !ubo && slot >= 0 && slot < 32 && (ptr_slots[st] >> slot & 1)) written = 0;
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
-    if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
+    if (slot >= 0 && slot < (ubo ? 16 : 32)) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
         uint32_t off = (uint32_t)r->handle * 4;
@@ -2221,7 +2223,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                 }   // slot 1: the program (bind_sig); others: the zero buffer
             } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
                 int ubo, slot = ssbo_slot(r, st, &ubo);
-                if (slot >= 0 && slot < 16) {
+                if (slot >= 0 && slot < (ubo ? 16 : 32)) {
                     rs_add(tmp, &n, ex, ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot], sizeof(p_bind_buf));
                 } else if (ubo_ptr_res(r)) {
                     if (np == RS_PTRS) { ok = 0; break; }
@@ -3162,9 +3164,20 @@ static int ptr_readable(uint64_t a, uint64_t n) {
 // st: NVN_STAGE_CS for a dispatch, NVN_STAGE_VS or NVN_STAGE_FS for a draw, NVN_STAGE_TS, NVN_STAGE_MS or
 // NVN_STAGE_FS for a mesh draw (the stages whose storage table the translator's fallback searches: c0 0x310, 0x110,
 // 0x510, and 0x670 and 0x770 with patch 0024).
-static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
+static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[32]) {
     p_bind_buf *sb = ex->ssbo[st];
-    memcpy(saved, sb, 16 * sizeof *sb);
+    memcpy(saved, sb, 32 * sizeof *sb);
+    // Compute's 16 extra table entries are used only without VRAM mirrors for now: with OOT_MEMORY=import they bring the
+    // level's culling counts (e6d5432f's category 3 read its count, 0 before) and a better picture, with mirrors the
+    // level renders black, for a reason not found yet (binding them written does not help; docs/level.md, 2026-11-08).
+    // OOT_PTR_SLOTS=16 or 32 decides.
+    static int cs_slots = -1;
+    if (cs_slots < 0) {
+        const char *e = getenv("OOT_PTR_SLOTS");
+        cs_slots = e && *e ? (atoi(e) == 16 ? 16 : 32) : vk_mirror_on ? 16 : 32;
+        rt_log("vk_exec: compute pointer targets in %d table slots (%s)", cs_slots, e && *e ? "OOT_PTR_SLOTS" : vk_mirror_on ? "VRAM mirrors on" : "no mirrors");
+    }
+    int nslots = st == NVN_STAGE_CS ? cs_slots : 16;   // compute's table has 16 more entries for pointer targets (patch 0025)
     int added = 0;
     ptr_slots[st] = 0;
     static int off = -1, off_gfx;   // OOT_PTR_BIND=0 (diagnostic): no pointer targets bound; OOT_PTR_BIND_GFX=0: none for draws
@@ -3195,7 +3208,7 @@ static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
             uint64_t v = *(const uint64_t *)(uintptr_t)(base + o);
             if (v < 0x10000 || (v >> 40) || (v & 3)) continue;
             int known = 0, free_slot = -1;
-            for (int j = 0; j < 16; j++) {
+            for (int j = 0; j < nslots; j++) {
                 if (sb[j].size && v >= sb[j].addr && v < sb[j].addr + sb[j].size) known = 1;
                 if (!sb[j].size && free_slot < 0) free_slot = j;
             }
@@ -3290,7 +3303,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d);
 // A dispatch with the pointer targets of its storage buffers bound for it (ptr_targets_add), then the game's bindings.
 static void op_dispatch_ptr(VkExec *ex, const void *payload, int indirect) {
-    p_bind_buf saved[16];
+    p_bind_buf saved[32];
     int added = ptr_targets_add(ex, NVN_STAGE_CS, saved);
     if (indirect) op_dispatch_ind(ex, payload);
     else op_dispatch(ex, payload);
@@ -3303,7 +3316,7 @@ static void op_dispatch_ptr(VkExec *ex, const void *payload, int indirect) {
 // pointer keep their bindings untouched, so their resource sets stay cached.
 static void op_draw_ptr(VkExec *ex, int op, const void *payload) {
     static const int st[2] = {NVN_STAGE_VS, NVN_STAGE_FS};
-    p_bind_buf saved[2][16];
+    p_bind_buf saved[2][32];
     int added[2];
     for (int i = 0; i < 2; i++) added[i] = ptr_targets_add(ex, st[i], saved[i]);
     switch (op) {
@@ -3324,7 +3337,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d);
 // pointers), then the game's bindings.
 static void op_draw_mesh_ptr(VkExec *ex, const p_draw_mesh *d) {
     static const int st[3] = {NVN_STAGE_TS, NVN_STAGE_MS, NVN_STAGE_FS};
-    p_bind_buf saved[3][16];
+    p_bind_buf saved[3][32];
     int added[3];
     for (int i = 0; i < 3; i++) added[i] = ptr_targets_add(ex, st[i], saved[i]);
     op_draw_mesh(ex, d);

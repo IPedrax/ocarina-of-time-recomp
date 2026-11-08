@@ -166,3 +166,18 @@ After each change that alters what a shader computes: the `verify-shader-change`
   - The game embeds Lua; its error longjmp crashed us at `main+0x1661690` (d105aa9 fixes it, runtime/sjlj.c).
   - New dump (`files/`, base + update packages, 186,583 RomFS files as other players have) in use since this
     evening; code identical, 9 RomFS files differ from the old one, none in Kokiri Forest.
+- 2026-11-08, night: pass 0's path, measured with the buffer probe (tools/probe_reach.py, OOT_PROBE ...:b<slot>, slot 6
+  `0x2a3711000`, which the CPU does not read, holds all 21,632 threads).
+  - The kernel gives each warp a category from a prefix-sum table in its bank 3 (c[3][0x660..0x6f0]: 0, 0, 141, 286,
+    360, 360, 614, 652, 675, 675 warps; read correctly) and then each category's item count through two levels of
+    pointers: bank 4 (uniform slot 1) -> a table at 0x29bb2b880 -> the category's buffer (0x2a19e9000 for 2,
+    0x2a1b4c000 for 3, ...), whose first word is the count. A warp past its count exits at 0x430.
+  - Category 2 read its count (4502) and worked; category 3 read 0 although the memory held 4618, because its buffer
+    had no slot: the run-time table search (0022) has 16 entries and the kernel's own buffers plus the pointers in
+    its storage and uniform buffers are more than that. Categories 3-8 (79% of the threads) exited at once.
+  - Patch 0025 gives compute's search 32 entries (c0 0x310-0x510, the host's second table at 0x410 from ssbo[16..31],
+    48 storage slots). With it category 3 reads 4618. Under OOT_MEMORY=import the level renders better than ever
+    (build/logs/t32-import.png: the house's walls lit, one white spike) at 35-39 fps; with the VRAM mirrors on the
+    level renders black (build/logs/t32-level.png), and binding the extra targets written does not help. So the
+    extra entries are on only without mirrors for now (OOT_PTR_SLOTS=16|32 decides); finding what the mirrors break
+    is next.
