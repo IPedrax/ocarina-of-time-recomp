@@ -3,7 +3,7 @@
 one file) and list or extract its packages.
 
     python3.14 tools/extract_nup.py [--config config.local.toml] --list
-    python3.14 tools/extract_nup.py [--config config.local.toml] [--package N] [--exefs-only | --romfs-only] [--verify]
+    python3.14 tools/extract_nup.py [--config config.local.toml] [--package N] [--exefs-only | --romfs-only] [--no-verify]
 
 Extraction writes the package's ExeFS to build/extracted/v<version>/exefs and its RomFS as the image the runtime reads
 (runtime/romfs.c), build/extracted/v<version>/romfs/romfs.bin and index.json: the files back to back in path order,
@@ -221,7 +221,7 @@ class Nup:
         index = {'status': 'pass' if verify else 'unverified', 'version': version, 'source': self.path.name,
                  'romfs_size': total, 'romfs_sha256': whole.hexdigest(),
                  'integrity': ('every file checked against its SHA-256 in the NUP TOC, whose own SHA-256 the superblock '
-                               'holds') if verify else 'not checked (run with --verify)',
+                               'holds') if verify else 'not checked (extracted with --no-verify)',
                  'files': files}
         (dest / 'index.json.part').write_text(json.dumps(index), encoding='utf-8')
         os.replace(part, image)
@@ -310,7 +310,11 @@ def main():
     group = ap.add_mutually_exclusive_group()
     group.add_argument('--exefs-only', action='store_true')
     group.add_argument('--romfs-only', action='store_true')
-    ap.add_argument('--verify', action='store_true', help='check every extracted file against its SHA-256')
+    # On by default: tools/romfs_index.py (run by tools/build_game.py) takes only a RomFS image whose index.json
+    # records a verified extraction, and the hashing costs little next to the decompression.
+    ap.add_argument('--verify', action=argparse.BooleanOptionalAction, default=True,
+                    help='check every extracted file against its SHA-256 (default; --no-verify skips it, and '
+                         'tools/build_game.py then refuses the RomFS)')
     ap.add_argument('--romfs-loose', action='store_true',
                     help='write the RomFS as loose files in romfs_files/ instead of the romfs/ image the runtime reads')
     ap.add_argument('--out', help='output folder (default build/extracted/v<version>)')

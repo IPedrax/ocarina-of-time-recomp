@@ -313,6 +313,7 @@ static uint32_t up(L *l, uint32_t n) {
 
 static int uniform_op(uint32_t op);
 static uint32_t up_fields(const Insn *x);
+static uint32_t up_register(L *l);
 static int successors(const L *l, uint32_t i, uint32_t *out, uint32_t cap);
 static void scratch_at(L *l, uint32_t i);
 
@@ -441,7 +442,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
     int predicated = g != 7;
     if (g == 15) return;
     if (uniform_op(op)) {
-        if (op == 0x3c2) set_run(use, f24, 1);                     // R2UR reads a general register
+        if (op == 0x3c2 || op == 0x3c4) set_run(use, f24, 1);      // R2UR, REDUX read a general register
         return;
     }
     if (base >= 0x140 && base < 0x160) {
@@ -458,7 +459,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
     int store = base == 0x186 || base == 0x187 || base == 0x188 || base == 0x122 || base == 0x18e || base == 0x127 ||
                 base == 0x19b || base == 0x19c || base == 0x19e;
     int no_dst = store || base == 0x118 || base == 0x11a || base == 0x192 || base == 0x11d || base == 0x004 || base == 0x01c ||
-                 (base == 0x00b) || (base == 0x00c);
+                 (base == 0x00b) || (base == 0x00c) || (base == 0x034);   // FSETP, ISETP, HSETP2: predicates only
     // The destination's width: loads by their size (73-75: 6 = 128 bits, 5 = 64), texture ops by their mask (the
     // first two components to Rd, the rest to the second destination at 64-71 when given), IMAD.WIDE and a 64-bit
     // CS2R two registers; else one. Over-stating a write is unsafe (it frees a live register), so packed-half
@@ -501,12 +502,12 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         set_run(use, f24, coords[bits(x, 61, 3)]);
         set_run(use, f32 & 0x3f, (uint32_t)__builtin_popcount(bits(x, 72, 4)));
     }
-    if (base == 0x197) {                                          // SULD: coordinates by the dimension, a result a channel
+    if (base == 0x197) {                                          // SULD: coordinates by the dimension, a result by mask
         static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
         uint32_t n = (uint32_t)__builtin_popcount(bits(x, 72, 4));
         set_run(use, f24, coords[bits(x, 61, 3)]);
-        if (!predicated) set_run(def, f16, n);
-        else set_run(use, f16, n);
+        if (!predicated) set_run(def, f16, n ? n : 1);
+        else set_run(use, f16, n ? n : 1);
     }
 }
 
@@ -662,14 +663,17 @@ static void scan_uniform(L *l) {
         }
     }
     memset(l->up_map, 0xff, sizeof l->up_map);
-    l->up_swap = (l->used_preds & 0x7f) == 0x7f;
+    // Swap mode when the uniform predicates do not fit in the predicates the program leaves free (counting only all
+    // seven used left a program with five ordinary and three uniform predicates without one: "no predicate free").
+    uint32_t ups = 0;
+    for (uint32_t i = 0; i < l->n; i++) ups |= up_fields(&l->in[i]);
+    l->up_swap = __builtin_popcount(l->used_preds & 0x7f) + __builtin_popcount(ups & 0x7f) > 7;
     // The registers the lowering needs for the program's length: one per uniform register no forwarding covers,
     // one for the uniform predicates when they are swapped through a register. The scratch block starts above them.
     uint32_t nur = 0;
     for (uint32_t n = 0; n < 63; n++)
         if (l->needs_reg[n]) nur++;                               // defined or not (a read before any definition)
-    if ((l->used_preds & 0x7f) == 0x7f)                           // the uniform predicates' register (up_swap)
-        for (uint32_t i = 0; i < l->n; i++) if (up_fields(&l->in[i])) { nur++; break; }
+    if (l->up_swap && ups) nur++;                                 // the uniform predicates' register (up_swap)
     l->scratch_base = l->ur_next + nur > 255 ? 255 : l->ur_next + nur;
     for (uint32_t r = l->ur_next; r < l->scratch_base; r++) l->reserved[r / 64] |= 1ull << (r % 64);
     l->scanned = 1;
@@ -687,6 +691,7 @@ static uint32_t up_fields(const Insn *x) {
         case 0x087: fields = 0x10; break;
         case 0x086: fields = 0x04; break;
         case 0x09c: fields = 0x1f; break;
+        case 0x083: m |= x->w[1] & 0x7f; break;                   // UP2UR: the uniform predicates in its mask
         default: break;
         }
     } else if (op == 0x81c && bits(x, 67, 1)) {
@@ -1171,15 +1176,14 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
     int ext = bits(x, 74, 1);
     uint32_t cin = bits(x, 87, 3), cin_inv = bits(x, 90, 1);
     if (!ext && bits(x, 87, 4) != 15) return (void)fail(l, "LEA carry in without .X");
-    if (neg_b && !bits(x, 80, 1) && cout == 7 && !ext && !neg_a) {
-        // (a << shift) - b, as SHL then IADD with NegB (AvgMode 1 at 48, Ryujinx InstIaddR): the end-of-frame
-        // upscale kernel d5e222be (2026-11-06)
-        uint32_t t = S(l, 2), rb = to_reg(l, b, 1, 0, 0);
-        emit(l, base(l, 0x3848000000000000ull, t, a.reg) | ((uint64_t)shift << 20));   // SHL imm
-        emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)rb << 20) | ((uint64_t)1 << 48));
-        return;
+    if (neg_b) {
+        // -b in scratch 1 (IADD RZ - b, as lower_iabs); the carry of a + (-b) is not the hardware's a + ~b + 1, so
+        // only without a carry out or in.
+        if (cout != 7 || ext) return (void)fail(l, "LEA negated addend with a carry");
+        uint32_t rbv = to_reg(l, b, 1, 0, 0), t = S(l, 1);
+        emit(l, base(l, 0x5c10000000000000ull, t, RZ) | ((uint64_t)rbv << 20) | ((uint64_t)1 << 48));
+        b = reg_src(t), neg_b = 0;
     }
-    if (neg_b) return (void)fail(l, "LEA negated addend");
     if (bits(x, 80, 1)) {
         // LEA.HI: Rd = Rb + the high word of (Rc:Ra << shift): SHF.L Rt = (Rc:Ra) << shift high, or a right shift
         // of Ra by 32 - shift when Rc is RZ (sign-extended by 73); then the add, with a carry out when asked.
@@ -1282,7 +1286,11 @@ static void lower_imad(L *l, const Insn *x, uint32_t op) {
 }
 
 // IMAD.WIDE (0x025): Rd:Rd+1 = a * b + c:c+1, 64-bit; .U32 or signed (73). Low word by IMAD, high by IMAD.HI,
-// then the 64-bit add of c.
+// then the 64-bit add of c. b takes IMAD's register, constant or 20-bit immediate form (the same .HI bit 54 and
+// signedness bits 48 and 53 in each). The halves go straight into Rd:Rd+1 when no operand read after a half is written
+// is that half (Rd is read-only to the IMAD.HI that follows, Rd+1 only to the adds of c); otherwise through two
+// scratch registers. Vertex shaders of the level that use registers into the R220s ran out of scratch on runs of
+// IMAD.WIDE Rd, Rd+1, 0x10, R228 (2026-11-06).
 static void lower_imad_wide(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), c = bits(x, 64, 8);
     int is_signed = bits(x, 73, 1);
@@ -1290,15 +1298,32 @@ static void lower_imad_wide(L *l, const Insn *x) {
     if (bits(x, 72, 1) || bits(x, 74, 7) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) ||
         bits(x, 87, 4) != 15 || rd >= 254 || (c != RZ && c >= 254))
         return (void)fail(l, "IMAD.WIDE mode");
-    uint32_t rb = to_reg(l, b, 1, 0, 0);
-    uint32_t lo = S(l, 2), hi = S(l, 3);
+    int is32;
+    uint64_t bw = b.neg || b.abs_ ? 0x5a00000000000000ull | (uint64_t)to_reg(l, b, 1, 0, 0) << 20   // modifiers applied
+                                  : b_slot(l, b, 0x5a00000000000000ull, 0x4a00000000000000ull, 0x3400000000000000ull, 0, 0, 1, &is32);
+    if (l->failed) return;
+    uint32_t rb = (bw >> 56) == 0x5a ? (uint32_t)(bw >> 20 & 0xff) : RZ;   // the register b is read from, if any
+    int direct = rd != a.reg && rd != rb && (c == RZ || (rd != c + 1 && rd + 1 != c && rd + 1 != c + 1));
     uint64_t sign = is_signed ? ((uint64_t)1 << 48) | ((uint64_t)1 << 53) : 0;
-    emit(l, base(l, 0x5a00000000000000ull, lo, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)RZ << 39));
-    emit(l, base(l, 0x5a00000000000000ull, hi, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
+    if (!direct && c != RZ && rd != a.reg && rd != rb && rd != c + 1) {
+        // One scratch register t (Rd = c is the usual case: IMAD.WIDE R228, R115, 0x10, R228): t = lo(a b),
+        // Rd = t + c setting the carry, t = hi(a b) (IMAD without .CC keeps the carry), Rd+1 = t + c+1 + carry.
+        uint32_t t = S(l, 0);
+        if (t == rb) t = S(l, 1);   // b materialised in scratch 1 is never scratch 0; this is for safety only
+        emit(l, bw | l->pred | t | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39));
+        emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)c << 20) | ((uint64_t)1 << 47));
+        emit(l, bw | l->pred | t | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
+        emit(l, base(l, 0x5c10000000000000ull, rd + 1, t) | ((uint64_t)(c + 1) << 20) | ((uint64_t)1 << 43));
+        return;
+    }
+    uint32_t lo = direct ? rd : S(l, 2), hi = direct ? rd + 1 : S(l, 3);
+    emit(l, bw | l->pred | lo | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39));
+    emit(l, bw | l->pred | hi | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
     if (c != RZ) {                                        // + c:c+1 with the carry through the condition code
         emit(l, base(l, 0x5c10000000000000ull, lo, lo) | ((uint64_t)c << 20) | ((uint64_t)1 << 47));
         emit(l, base(l, 0x5c10000000000000ull, hi, hi) | ((uint64_t)(c + 1) << 20) | ((uint64_t)1 << 43));
     }
+    if (direct) return;
     mov_reg(l, rd, lo);
     mov_reg(l, rd + 1, hi);
 }
@@ -1438,6 +1463,29 @@ static void lower_ipa(L *l, const Insn *x) {
                 ((uint64_t)7 << 47) | ((uint64_t)bits(x, 76, 2) << 52) | ((uint64_t)bits(x, 78, 1) << 55));
 }
 
+// IPA with an index register (0x526): the attribute's byte address is Ra (24-31) plus the attribute field. Maxwell's
+// IPA.IDX (bit 38) takes Ra as the whole address (Ryujinx InstEmitAttribute.Ipa ignores the immediate then), so the
+// sum goes into scratch first. Ryujinx's indexed path reads user attributes with perspective correction only:
+// constant and sample modes are refused.
+static void lower_ipa_idx(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), attr = bits(x, 64, 10), t = S(l, 0);
+    if (bits(x, 32, 8) != RZ || bits(x, 76, 3) || bits(x, 79, 1) || bits(x, 81, 3) != 7 || attr * 4 > 0x3ff)
+        return (void)fail(l, "IPA indexed mode");
+    if (ra == RZ) mov_imm(l, t, attr * 4);
+    else emit(l, base(l, 0x1c00000000000000ull, t, ra) | ((uint64_t)(attr * 4) << 20));   // IADD32I t, ra, attr * 4
+    emit(l, base(l, 0xe000000000000000ull, rd, t) | ((uint64_t)RZ << 20) | ((uint64_t)1 << 38) | ((uint64_t)7 << 47));
+}
+
+// FCHK (0x243 register b): Pd (81-83) set when a / b needs the slow path of a division (a denormal, infinite or
+// zero divisor, a result out of range). Maxwell has no FCHK and Ryujinx none to translate: Pd is false, so the
+// compiler's fast path (a reciprocal and two refinements) always runs; it is exact but for those edge cases.
+static void lower_fchk(L *l, const Insn *x) {
+    uint32_t pd = bits(x, 81, 3);
+    if (pd == 7) return;
+    // PSETP.AND.AND Pd, PT, PT, !PT, PT: (PT & !PT) & PT
+    emit(l, 0x5090000000000000ull | l->pred | ((uint64_t)pd << 3) | 7 | (7ull << 12) | (7ull << 29) | (1ull << 32) | (7ull << 39));
+}
+
 // ALD / AST: address 40-49 (bytes), components 74-75 (+ 1), patch 76, output 79; the vertex index register
 // at 32-39 (ALD) or 64-71 (AST); AST's data at 32-39. Maxwell ALD/AST with the same fields.
 static void lower_ald_ast(L *l, const Insn *x, int store) {
@@ -1524,7 +1572,9 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
     if (op == 0x381) {
         if ((x->w[2] & ~0x2e00u) != 0x001e8100u || (address & 1)) return (void)fail(l, "LDG register mode");
     } else {
-        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair(l, bits(x, 32, 6), 2);
+        // k 0: the scratch pair a forwarded base lands in is also the pair the add below writes in place, so a run
+        // of two dead registers is enough (k 2 asked for four: vertex shaders near R255 had no such run).
+        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair(l, bits(x, 32, 6), 0);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c1e1100u || x->w[2] == 0x0c1ebd00u;
         if ((!descriptor && (x->w[2] & ~(0x04000000u | 0x3fu | 0xe00u | 0x2000u)) != 0x081e8100u) || ubase == NOREG)
             return (void)fail(l, "LDG uniform mode");
@@ -1549,15 +1599,9 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
 static void lower_stg(L *l, const Insn *x, uint32_t op) {
     uint32_t data = bits(x, 32, 8), size = bits(x, 73, 3), address = bits(x, 24, 8), offset = bits(x, 40, 24);
     if (size > 6 || bits(x, 16, 8)) return (void)fail(l, "STG mode");
-    if (data == RZ && size > 4) {   // Maxwell has no wide RZ: zeros in an aligned scratch run (the 1x1x1 kernels
-                                    // before the fog clear 64- and 128-bit slots so, 2026-11-07)
-        uint32_t n = size == 6 ? 4 : 2, z = S_aligned(l, 4, n);
-        if (z == RZ) return;
-        for (uint32_t i = 0; i < n; i++) mov_imm(l, z + i, 0);
-        data = z;
-    }
+    int wide_zero = data == RZ && size > 4;   // RZ names one register: 64 or 128 zero bits come from scratch below
     if (op == 0x986) {
-        uint32_t ubase = ur_pair(l, bits(x, 64, 6), 2);
+        uint32_t ubase = ur_pair(l, bits(x, 64, 6), 0);   // k 0 as in lower_ldg
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c101100u;
         if ((!descriptor && (x->w[2] & ~(0x04000000u | 0x3fu | 0xe00u)) != 0x0810a100u) || !bits(x, 72, 1))
             return (void)fail(l, "STG uniform mode");
@@ -1575,6 +1619,12 @@ static void lower_stg(L *l, const Insn *x, uint32_t op) {
         }
     } else if ((x->w[2] & ~0xe00u) != 0x0010a100u || (address & 1)) {
         return (void)fail(l, "STG register mode");
+    }
+    if (wide_zero) {   // an aligned pair or quad of zeros from scratch 2 up (0-1 may hold the address)
+        uint32_t n = size == 5 ? 2 : 4, k = 2;
+        while ((l->scratch_base + k) % n) k++;
+        for (uint32_t i = 0; i < n; i++) mov_imm(l, S(l, (int)(k + i)), 0);
+        data = S(l, (int)k);
     }
     emit(l, 0xeed8000000000000ull | l->pred | data | ((uint64_t)address << 8) | ((uint64_t)offset << 20) | ((uint64_t)1 << 45) |
                 ((uint64_t)size << 48));
@@ -1601,19 +1651,33 @@ static void lower_sust(L *l, const Insn *x) {
                 ((uint64_t)hr << 39));
 }
 
-// SULD.P (0xb97): SUST.P's load, the handle from a constant word as there, coordinates at 24-31, destination at
-// 16-23 (one register a channel of the mask at 72-75), dimension 61-63; 81-83 the result predicate (taken only as
-// PT), 84 always set in the game's kernels. Maxwell SULD.B (Ryujinx InstSuldB, 0xeb00): destination 0-7,
-// coordinates 8-15, mask 20-23, result predicate 30-32 (PT), dimension 33-35, handle register 39-46. The fog and
-// atmosphere kernels around main+0x28ed0c read their images so (2026-11-06).
+// SURED (0x59f, 2026-11-07: the level's culling kernel 1cd76332, which every mesh draw's indirect counts depend on):
+// an atomic reduction into a surface without a result, the handle from a constant-buffer word as SUST.P's (dword
+// index 40-53, bank 54-58), coordinates 24-31, the value 32-39, dimension 61-63, the reduction 87-89 (Maxwell's
+// numbering, as RED's), U32, .IGN (Lichii lower_to_maxwell.h names the form; behaviour only). Maxwell SURED.B
+// (bindless, Ryujinx InstSuredB, prefix 0xeb50): the value 0-7, coordinates 8-15, size 20-22 (0: U32), the
+// reduction 24-26, dimension 33-35, handle register 39-46.
+static void lower_sured(L *l, const Insn *x) {
+    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 8), dim = bits(x, 61, 3), op = bits(x, 87, 3);
+    if ((x->w[2] & ~0x03800000u) != 0x0010e000u || dim > 5 || bits(x, 59, 2) || bits(x, 16, 8))
+        return (void)fail(l, "SURED mode");
+    Src h = {0};
+    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (!cbuf_ok(&h)) return (void)fail(l, "SURED handle");
+    uint32_t hr = to_reg(l, h, 4, 0, 0);
+    emit(l, 0xeb50000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)op << 24) | ((uint64_t)dim << 33) |
+                ((uint64_t)hr << 39));
+}
+
+// SULD.P (0xb97, 2026-11-06: the level's compute kernels, 23 of them refused for it): SUST.P's layout for the
+// handle (dword index 40-53, bank 54-58), coordinates (24-31) and dimension (61-63), the destination at 16-23 (one
+// register per channel of the mask at 72-75), a predicate result at 81-83 (PT throughout the corpus) and 1 at
+// 84-86 in every one seen. Maxwell SULD.P.B (bindless, Ryujinx InstSuldB): dest 0-7, coordinates 8-15, channel
+// mask 20-23, the predicate result 30-32 (PT: none), dimension 33-35, handle register 39-46.
 static void lower_suld(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), coord = bits(x, 24, 8), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
-    if (bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 7 || bits(x, 85, 6) || bits(x, 32, 8) || bits(x, 59, 2) ||
-        mask == 0) {
-        char why[96];
-        snprintf(why, sizeof why, "SULD mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-        return (void)fail(l, why);
-    }
+    if (bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 7 || bits(x, 84, 3) != 1 || bits(x, 87, 5) || mask == 0)
+        return (void)fail(l, "SULD mode");
     Src h = {0};
     h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
     if (!cbuf_ok(&h)) return (void)fail(l, "SULD handle");
@@ -1893,15 +1957,13 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
     int dc = bits(x, 78, 1), half = bits(x, 79, 1), nodep = bits(x, 90, 1), array = dim == 5;
     int bindless = op == 0xf63;
     uint32_t handle = bindless ? to_reg(l, ur_src(l, bits(x, 40, 6)), 4, 0, 0) : RZ;
-    // Per-tap offsets (2): two packed registers in Rb, Rb+1, eight bits a value as Maxwell's (Ryujinx EmitTld4 reads
-    // 6-bit fields at 8-bit steps), taken over as they are; fp16 (79): Maxwell gathers floats, packed below as TEX's
-    // fp16 results are. The end-of-frame upscale kernel 92491530 gathers with both (2026-11-06).
+    // Per-tap offsets (2, PTP: two registers of four x/y byte pairs after the coordinates, Maxwell's TLD4.PTP) and
+    // fp16 results (79: the four components packed in pairs into Rd and the second destination) since 2026-11-06:
+    // the level's final pass 7034cdb8 gathers with both.
     if ((dim != 1 && !array) || toff == 3 || bits(x, 81, 3) != 7 || bits(x, 59, 1) || bits(x, 89, 1) ||
         mask == 0 || !bits(x, 60, 1) || (bindless && bits(x, 46, 13)) || (!bindless && bank >= 18) ||
-        (dc && (toff || array)) || (toff == 2 && (rb == RZ || array)))
-        { char why[96];   // the words, so a new form can be read off the log
-          snprintf(why, sizeof why, "TLD4 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-          return (void)fail(l, why); }
+        (dc && (toff || array)) || (half && (rd == RZ || (__builtin_popcount(mask) > 2 && rd2 == RZ))))
+        return (void)fail(l, "TLD4 mode");
     int plain = !toff && !dc;
     uint32_t cx = ra, cy = plain && !array ? rb : (ra == RZ ? RZ : ra + 1);
     uint32_t c0;
@@ -1926,7 +1988,7 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
             mov_cbuf(l, S(l, 4), &s);
         }
         if (extra != RZ) mov_reg(l, S(l, 5), extra);
-        if (toff == 2) mov_reg(l, S(l, 6), extra + 1);   // the second per-tap register
+        if (extra != RZ && toff == 2) mov_reg(l, S(l, 6), extra + 1);   // PTP: the second offsets register
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
@@ -1943,10 +2005,9 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
                     ((uint64_t)dc << 50) | ((uint64_t)7 << 51) | ((uint64_t)toff << 54) | ((uint64_t)comp << 56));
     }
     if (direct) return;
-    if (half) {   // (c0, c1) into Rd and (c2, c3) into Rd2 (or Rd+1) as halves, as lower_tex does
+    if (half) {   // pairs of components as halves: Rd = (c1 << 16) | c0, the second destination (c3 << 16) | c2
         for (uint32_t pair = 0; pair < 2 && pair * 2 < components; pair++) {
-            uint32_t t = pair == 0 ? rd : split ? rd2 : (rd == RZ ? RZ : rd + 1);
-            if (t == RZ) continue;
+            uint32_t t = pair == 0 ? rd : split ? rd2 : rd + 1;
             uint32_t lo = S(l, (int)(pair * 2)), hi = pair * 2 + 1 < components ? S(l, (int)(pair * 2 + 1)) : RZ;
             emit(l, base(l, 0x5ca8000000000000ull, S(l, 6), 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)lo << 20));
             emit(l, base(l, 0x5ca8000000000000ull, S(l, 7), 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)hi << 20));
@@ -2069,64 +2130,52 @@ static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
     emit(l, l->pred | (HFMA2_R(rd, m, 0, d, b) | ((uint64_t)b_swz << 35)));
 }
 
-// HMUL2 (0x032): a * b on half pairs; register (0x232, b swizzle 60-61) or a packed half-pair immediate (0x832).
-// Taken: a's swizzle (74-75); everything else in the third word and b's modifiers must be clear. The end-of-frame
-// upscaler 6f1e1e41 doubles a pair (2026-11-06). Maxwell HMUL2 R: a 8, b 20, b swizzle 28-29, a swizzle 47-48.
+// HMUL2 (0x232 register b; 0x432 / 0x832 an immediate half pair in 32-63; 0xa32 a constant, as HADD2's): packed
+// half multiply, HADD2's operand fields (a 24-31, swizzle 74-75, abs 73, neg 72; b swizzle 60-61, abs 62, neg 63),
+// saturate 77, FMZ 80 (2026-11-06: the level's upscaler and final pass). Maxwell HMUL2 R (Ryujinx InstHmul2R):
+// a 8-15, b 20-27, b swizzle 28-29, abs b 30, negate (the product) 31, sat 32, FMZ 39-40, abs a 44, a swizzle 47-48.
 static void lower_hmul2(L *l, const Insn *x, uint32_t op) {
-    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), a_swz = bits(x, 74, 2), b, b_swz = 0;
-    int b_neg = 0, b_abs = 0;
-    if (bits(x, 64, 10) || bits(x, 76, 20)) {
-        char why[96];
-        snprintf(why, sizeof why, "HMUL2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-        return (void)fail(l, why);
-    }
-    if (op == 0x832) {
+    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), a_swz = bits(x, 74, 2);
+    int a_abs = bits(x, 73, 1), a_neg = bits(x, 72, 1);
+    if (bits(x, 76, 1) || bits(x, 78, 2) || (bits(x, 81, 10) != 0 && op == 0x232)) return (void)fail(l, "HMUL2 mode");
+    uint32_t b, b_swz = 0; int b_abs = 0, b_neg = 0;
+    if (op == 0x232) {
+        b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
+    } else if (op == 0x432 || op == 0x832) {
         b = S(l, 0);
         mov_imm(l, b, x->w[1]);
-    } else if (op == 0x232) {
-        b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
-    } else if (op == 0xa32) {   // b from a constant bank, with its swizzle and modifiers as the register form's
-        Src s = {0}; s.kind = 2, s.cb_off = bits(x, 38, 16), s.cb_bank = bits(x, 54, 5);
-        if (!cbuf_ok(&s)) return (void)fail(l, "HMUL2 constant");
-        b = S(l, 0), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
-        mov_cbuf(l, b, &s);
     } else {
-        char why[96];
-        snprintf(why, sizeof why, "HMUL2 form %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-        return (void)fail(l, why);
+        Src c = {0}; c.kind = 2, c.cb_off = bits(x, 38, 16), c.cb_bank = bits(x, 54, 5);
+        if (!cbuf_ok(&c)) return (void)fail(l, "HMUL2 constant");
+        b = S(l, 0), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
+        mov_cbuf(l, b, &c);
     }
-    // b's negation as Maxwell's NegA (31: a * -b = -(a * b)), its absolute value as AbsB (30)
-    emit(l, l->pred | HMUL2_R(rd, a, b) | ((uint64_t)b_swz << 28) | ((uint64_t)b_abs << 30) | ((uint64_t)b_neg << 31) |
-                ((uint64_t)a_swz << 47));
+    emit(l, base(l, 0x5d08000000000000ull, rd, a) | ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)b_abs << 30) |
+                ((uint64_t)(a_neg ^ b_neg) << 31) | ((uint64_t)bits(x, 77, 1) << 32) | ((uint64_t)bits(x, 80, 1) << 39) |
+                ((uint64_t)a_abs << 44) | ((uint64_t)a_swz << 47));
 }
 
-// HSETP2 (0x034): compare two half pairs into two predicates, the low halves' result in the predicate at 81-83 and
-// the high halves' at 84-86, each ANDed with the accumulator at 87-89 (negated by 90); compare 76-79 as FSETP's.
-// Register form (0x234, b at 32 with its swizzle at 60) or a packed half-pair immediate (0x434, in the second word).
-// Taken: the combination with the accumulator at 69-70 (AND, OR, XOR) and a's swizzle at 74-75; not taken: a's
-// negation and absolute value (72-73), .H_AND (71), b's modifiers. The end-of-frame upscaler 0a9afab0 compares a
-// pair against {0.1, 0.1}, then one half again ORed with the high result (2026-11-06). Maxwell's HSETP2 register form
-// (0x5d20) with the fields of its HSET2 (0x5d18, above): Pd 3-5, the second predicate 0-2, b swizzle 28-29, compare
-// 35-38, accumulator 39-41 (42), combination 45-46, a swizzle 47-48.
+// HSETP2 (0x234 register b: 32-39, swizzle 60-61, abs 62, neg 63; 0x434 an immediate half pair in 32-63): a
+// 24-31, swizzle 74-75, neg 72, abs 73; combine 69-70, H_AND 71, compare 76-79, FTZ 80, P 81-83, Q 84-86, input
+// predicate 87-89 (negated by 90) (Lichii's Ampere front end, GPL, read for the field meanings; 2026-11-06: the
+// level's upscaler 0a9afab0). Maxwell HSETP2 R (Ryujinx InstHsetp2R): P 3-5, Q 0-2, a 8-15, b 20-27, b swizzle
+// 28-29, abs b 30, neg b 31, compare 35-38, input 39-41 (negated by 42), neg a 43, abs a 44, combine 45-46,
+// a swizzle 47-48, H_AND 49, FTZ 6.
 static void lower_hsetp2(L *l, const Insn *x, uint32_t op) {
-    uint32_t a = bits(x, 24, 8), b, b_swz = 0, combine = bits(x, 69, 2), a_swz = bits(x, 74, 2);
-    if (bits(x, 64, 5) || bits(x, 71, 3) || combine == 3 || bits(x, 80, 1)) {
-        char why[96];
-        snprintf(why, sizeof why, "HSETP2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-        return (void)fail(l, why);
-    }
+    uint32_t b, bswz = 0, babs = 0, bneg = 0;
+    if (bits(x, 91, 1)) return (void)fail(l, "HSETP2 mode");
     if (op == 0x434) {
         b = S(l, 0);
         mov_imm(l, b, x->w[1]);
-    } else if (op == 0x234 && !bits(x, 62, 2)) {
-        b = bits(x, 32, 8), b_swz = bits(x, 60, 2);
     } else {
-        return (void)fail(l, "HSETP2 form");
+        if ((x->w[1] & 0x0fffff00u) || bits(x, 64, 5)) return (void)fail(l, "HSETP2 mode");
+        b = bits(x, 32, 8), bswz = bits(x, 60, 2), babs = bits(x, 62, 1), bneg = bits(x, 63, 1);
     }
-    emit(l, l->pred | 0x5d20000000000000ull | bits(x, 84, 3) | ((uint64_t)bits(x, 81, 3) << 3) | ((uint64_t)a << 8) |
-                ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)bits(x, 76, 4) << 35) |
-                ((uint64_t)bits(x, 87, 3) << 39) | ((uint64_t)bits(x, 90, 1) << 42) | ((uint64_t)combine << 45) |
-                ((uint64_t)a_swz << 47));
+    emit(l, 0x5d20000000000000ull | l->pred | bits(x, 84, 3) | ((uint64_t)bits(x, 81, 3) << 3) | ((uint64_t)bits(x, 80, 1) << 6) |
+                ((uint64_t)bits(x, 24, 8) << 8) | ((uint64_t)b << 20) | ((uint64_t)bswz << 28) | ((uint64_t)babs << 30) |
+                ((uint64_t)bneg << 31) | ((uint64_t)bits(x, 76, 4) << 35) | ((uint64_t)bits(x, 87, 3) << 39) |
+                ((uint64_t)bits(x, 90, 1) << 42) | ((uint64_t)bits(x, 72, 1) << 43) | ((uint64_t)bits(x, 73, 1) << 44) |
+                ((uint64_t)bits(x, 69, 2) << 45) | ((uint64_t)bits(x, 74, 2) << 47) | ((uint64_t)bits(x, 71, 1) << 49));
 }
 
 // F2FP (0x23e, Ampere) .PACK_AB: Rd = (half of Ra) << 16 | half of Rb, rounding 79-80 (round to nearest only).
@@ -2197,41 +2246,56 @@ static void lower_p2r_r2p(L *l, const Insn *x, int r2p) {
     else emit(l, base(l, 0x38e8000000000000ull, rd, ra) | ((uint64_t)x->w[1] << 20) | ((uint64_t)bits(x, 76, 2) << 41));
 }
 
+// Pd = LUT(a, b, c) over predicates a, b, c (bit 3 negates; the table indexes them as bits 2, 1, 0) by one Maxwell
+// PSETP, which computes (P[12-14] op P[29-31]) op2 P[39-41] (Ryujinx InstEmitPredicate.Psetp; op and op2 from
+// BoolOpAB 24-25 and BoolOpC 45-46: 0 and, 1 or, 2 xor), each input negatable, into Pd at 3-5 and the same with the
+// inner result inverted into 0-2. The search tries each input in the outer role, every negation and op pair and
+// both outputs: 114 of the 256 tables. (Before 2026-11-06 the outer slot held a while the tables were matched with c
+// outer, so an asymmetric table such as (a & b) | c came out as (c & b) | a.) 0: no PSETP computes it.
+static int plop3_psetp(L *l, uint32_t pd, uint32_t lut, const uint32_t in[3]) {
+    for (int z = 0; z < 3; z++) {
+        int x = z == 0 ? 1 : 0, y = z == 2 ? 1 : 2;
+        for (uint32_t n = 0; n < 8; n++)
+            for (uint32_t op = 0; op < 3; op++)
+                for (uint32_t op2 = 0; op2 < 3; op2++)
+                    for (uint32_t inv = 0; inv < 2; inv++) {
+                        uint32_t t = 0;
+                        for (uint32_t v = 0; v < 8; v++) {
+                            uint32_t u[3] = {(v >> 2 & 1) ^ (n >> 2 & 1), (v >> 1 & 1) ^ (n >> 1 & 1), (v & 1) ^ (n & 1)};
+                            uint32_t ab = (op == 0 ? u[x] & u[y] : op == 1 ? u[x] | u[y] : u[x] ^ u[y]) ^ inv;
+                            t |= (op2 == 0 ? ab & u[z] : op2 == 1 ? ab | u[z] : ab ^ u[z]) << v;
+                        }
+                        if (t != lut) continue;
+                        uint32_t neg[3] = {n >> 2 & 1, n >> 1 & 1, n & 1};
+                        uint32_t px = in[x] ^ (neg[x] << 3), py = in[y] ^ (neg[y] << 3), pz = in[z] ^ (neg[z] << 3);
+                        uint64_t dst = inv ? (uint64_t)pd | (7ull << 3) : 7ull | ((uint64_t)pd << 3);
+                        emit(l, 0x5090000000000000ull | l->pred | dst | ((uint64_t)(px & 7) << 12) | ((uint64_t)(px >> 3) << 15) |
+                                    ((uint64_t)op << 24) | ((uint64_t)(py & 7) << 29) | ((uint64_t)(py >> 3) << 32) |
+                                    ((uint64_t)(pz & 7) << 39) | ((uint64_t)(pz >> 3) << 42) | ((uint64_t)op2 << 45));
+                        return 1;
+                    }
+    }
+    return 0;
+}
+
 // PLOP3 (0x01c): Pd = LUT(Pa, Pb, Pc) with table bits 64-66 and 72-76, inputs at 87-90, 77-80, 68-71 (bit 3
-// negates), outputs 81-83 and 84-86; bit 67 makes the third a uniform predicate. Maxwell PSETP covers
-// (a op b) op2 c for and/or/xor; other tables are not lowered.
-static void lower_plop3(L *l, const Insn *x) {
+// negates), outputs 81-83 and 84-86; bit 67 makes the third a uniform predicate. UPLOP3 (uniform 0x09c) has the same
+// fields over uniform predicates only (uniform = 1).
+static void lower_plop3_any(L *l, const Insn *x, int uniform) {
     uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), lut = bits(x, 64, 3) | (bits(x, 72, 5) << 3);
     uint32_t a = bits(x, 87, 4), b = bits(x, 77, 4), c = bits(x, 68, 4);
-    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, "PLOP3 mode");
-    if (bits(x, 67, 1)) c = (c & 8) | up(l, c & 7);
-    if (pd == 7) return;
-    // Tables of (a & b) | c style: PSETP Pd, PT, Pa, Pb, Pc with BoolOpAB at 24-25 and BoolOpC at 45-46
-    // (0 and, 1 or, 2 xor). The 8-bit table indexes (a, b, c) as bits 2, 1, 0.
-    static const struct { uint32_t lut, op_ab, op_c; } tables[] = {
-        {0x80, 0, 0}, {0xfe, 1, 1}, {0xa8, 0, 1}, {0xea, 1, 0}, {0xf8, 0, 1}, {0xc0, 0, 0}, {0xfc, 1, 0}, {0x96, 2, 2},
-        {0x78, 0, 2}, {0x3c, 1, 2}, {0xe8, 2, 1}, {0xb8, 0, 0},
-    };
-    // The table of (a op_ab b) op_c c over inputs negated by n (bit 2 a, bit 1 b, bit 0 c) for each candidate.
-    for (uint32_t n = 0; n < 8; n++) {
-        for (unsigned i = 0; i < sizeof tables / sizeof tables[0]; i++) {
-            uint32_t t = 0;
-            for (uint32_t v = 0; v < 8; v++) {
-                uint32_t u = v ^ n, va = u >> 2 & 1, vb = u >> 1 & 1, vc = u & 1, ab, r;
-                ab = tables[i].op_ab == 0 ? (va & vb) : tables[i].op_ab == 1 ? (va | vb) : (va ^ vb);
-                r = tables[i].op_c == 0 ? (ab & vc) : tables[i].op_c == 1 ? (ab | vc) : (ab ^ vc);
-                t |= r << v;
-            }
-            if (t != lut) continue;
-            uint32_t na = a ^ ((n >> 2 & 1) << 3), nb = b ^ ((n >> 1 & 1) << 3), nc = c ^ ((n & 1) << 3);
-            emit(l, 0x5090000000000000ull | l->pred | 7 | ((uint64_t)pd << 3) | ((uint64_t)(nc & 7) << 12) | ((uint64_t)(nc >> 3) << 15) |
-                        ((uint64_t)tables[i].op_ab << 24) | ((uint64_t)(nb & 7) << 29) | ((uint64_t)(nb >> 3) << 32) |
-                        ((uint64_t)(na & 7) << 39) | ((uint64_t)(na >> 3) << 42) | ((uint64_t)tables[i].op_c << 45));
-            return;
-        }
+    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, uniform ? "UPLOP3 mode" : "PLOP3 mode");
+    if (uniform) {
+        a = (a & 8) | up(l, a & 7), b = (b & 8) | up(l, b & 7), c = (c & 8) | up(l, c & 7);
+        if (pd != 7) pd = up(l, pd);
+    } else if (bits(x, 67, 1)) {
+        c = (c & 8) | up(l, c & 7);
     }
-    (void)fail(l, "PLOP3 table");
+    if (pd == 7) return;
+    uint32_t in[3] = {a, b, c};
+    if (!plop3_psetp(l, pd, lut, in)) (void)fail(l, "PLOP3 table");
 }
+static void lower_plop3(L *l, const Insn *x) { lower_plop3_any(l, x, 0); }
 
 // SHFL (0x189): modes at 58-59 (idx, up, down, bfly); lane in Rb (0x589) or an immediate at 53-57; the
 // clamp/segment mask as an immediate at 40-52 or in Rc (0x989); predicate output 81-83.
@@ -2268,38 +2332,47 @@ static void lower_fswzadd(L *l, const Insn *x) {
     emit(l, base(l, 0x50f8000000000000ull, rd, bits(x, 24, 8)) | ((uint64_t)bits(x, 64, 8) << 20) | ((uint64_t)mx << 28));
 }
 
-// REDUX (0x1c4, register form 0x3c4): a reduction of Ra over the warp's active lanes into a uniform register;
-// operation at 78-80 (0 AND, 1 OR, 2 XOR, 3 SUM, 4 MIN, 5 MAX as PTX redux.sync lists them). Taken: SUM, OR and XOR,
-// every other field clear. Maxwell has no reduction, and a SHFL butterfly would add the undefined values of lanes
-// that have exited (a 2026-11-06 butterfly version let the end-of-frame kernel 745220f3 through and a later frame lost
-// the device). So: the active mask from VOTE (ballot of PT), then each of the 32 lanes' Ra read with SHFL.IDX and
-// ANDed with lane j's mask bit spread to a whole word (SHL to bit 31, arithmetic SHR by 31), so an inactive lane adds
-// the operation's identity 0; then a move into the uniform's register. About 160 instructions, for a rare op.
-static void lower_redux(L *l, const Insn *x) {
-    uint32_t target = ur_dst(l, bits(x, 16, 8)), ra = bits(x, 24, 8), kind = bits(x, 78, 3);
-    if (x->w[1] || (x->w[2] & ~(7u << 14)) || (kind != 1 && kind != 2 && kind != 3)) {
-        char why[96];
-        snprintf(why, sizeof why, "REDUX mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-        return (void)fail(l, why);
-    }
-    uint32_t mask = S(l, 0), acc = S(l, 1), t = S(l, 2), b = S(l, 3);
-    emit(l, 0x50d8000000000000ull | l->pred | mask | ((uint64_t)7 << 39) | ((uint64_t)PT << 45) | ((uint64_t)1 << 48));  // VOTE.ANY
-    mov_imm(l, acc, 0);
-    for (uint32_t j = 0; j < 32; j++) {
-        emit(l, l->pred | 0xef10000000000000ull | t | ((uint64_t)ra << 8) | ((uint64_t)j << 20) | ((uint64_t)1 << 28) |
-                    ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48));                          // SHFL.IDX
-        emit(l, base(l, 0x3848000000000000ull, b, mask) | ((uint64_t)(31 - j) << 20));                             // SHL
-        emit(l, base(l, 0x3828000000000000ull, b, b) | ((uint64_t)31 << 20) | ((uint64_t)1 << 48));               // SHR.S32
-        emit(l, base(l, 0x5c40000000000000ull, t, t) | ((uint64_t)b << 20) | ((uint64_t)PT << 48));               // LOP.AND
-        if (kind == 3) emit(l, base(l, 0x5c10000000000000ull, acc, acc) | ((uint64_t)t << 20));                 // IADD
-        else emit(l, base(l, 0x5c40000000000000ull, acc, acc) | ((uint64_t)t << 20) | ((uint64_t)kind << 41) |
-                         ((uint64_t)PT << 48));                                                                     // LOP
-    }
-    if (target != RZ) mov_reg(l, target, acc);
-}
-
 // R2UR (0x1c2): the uniform takes the register's value (the first active lane's on the console; every lane holds
 // the same value where the compiler relies on it, so a move stands in).
+// REDUX (0x3c4, 2026-11-06: 27 of the level's compute kernels): a warp-wide reduction of a general register
+// (24-31) over the active lanes into a uniform register (16-23). words[2] gives the operation: 0xc000 SUM (modulo
+// 2^32), 0x14000 MAX, 0x10000 MIN (unsigned, or signed with bit 73), 0x4000 OR, 0x8000 XOR (Lichii's Ampere front
+// end, GPL, read for the field meanings). Lowered as a pass over the 32 lanes: the active mask from VOTE.ANY, each
+// lane's value by SHFL.IDX, turned into the operation's identity where the lane is not in the mask by mask
+// arithmetic (no predicate: the programs have none to spare), and folded in. Signed MIN/MAX work in the unsigned
+// order with the sign bit flipped.
+static void lower_redux(L *l, const Insn *x) {
+    uint32_t target = ur_dst(l, bits(x, 16, 8)), src = bits(x, 24, 8), mode = x->w[2] & ~0x200u;
+    int sgn = bits(x, 73, 1), max = mode == 0x14000, min = mode == 0x10000, sum = mode == 0xc000;
+    uint32_t lop = mode == 0x4000 ? 1 : mode == 0x8000 ? 2 : 0;
+    if (x->w[1] || (!max && !min && !sum && !lop) || (sgn && !max && !min) || l->pred != (uint64_t)PT << 16)
+        return (void)fail(l, "REDUX mode");
+    if (target == RZ) return;                                   // the result is never read
+    uint32_t mask = S(l, 0), t = S(l, 1), k = S(l, 2), acc = S(l, 3);
+    emit(l, l->pred | 0x50d8000000000000ull | mask | ((uint64_t)PT << 39) | ((uint64_t)PT << 45) |
+                ((uint64_t)1 << 48));                                                     // VOTE.ANY mask, PT
+    mov_imm(l, acc, min ? 0xffffffffu : 0);
+    for (uint32_t lane = 0; lane < 32; lane++) {
+        emit(l, l->pred | 0xef10000000000000ull | t | ((uint64_t)src << 8) | ((uint64_t)lane << 20) | ((uint64_t)1 << 28) |
+                    ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48));   // SHFL.IDX
+        if (sgn) emit(l, l->pred | LOP32I | t | ((uint64_t)t << 8) | ((uint64_t)0x80000000u << 20) | ((uint64_t)2 << 53));      // ^ sign
+        emit(l, l->pred | SHL_IMM(k, mask, 31 - lane));                                              // lane's bit to the top
+        emit(l, l->pred | 0x3829000000000000ull | k | ((uint64_t)k << 8) | ((uint64_t)31 << 20));    // SHR.S32 31: 0 or ~0
+        if (min)   // c = t | ~k
+            emit(l, l->pred | 0x5c40000000000000ull | t | ((uint64_t)t << 8) | ((uint64_t)k << 20) | ((uint64_t)1 << 40) |
+                        ((uint64_t)1 << 41) | ((uint64_t)PT << 48));
+        else       // c = t & k
+            emit(l, l->pred | 0x5c40000000000000ull | t | ((uint64_t)t << 8) | ((uint64_t)k << 20) | ((uint64_t)PT << 48));
+        if (sum) emit(l, l->pred | 0x5c10000000000000ull | acc | ((uint64_t)acc << 8) | ((uint64_t)t << 20));   // IADD
+        else if (max || min)                                                                      // IMNMX.U32
+            emit(l, l->pred | 0x5c20000000000000ull | acc | ((uint64_t)acc << 8) | ((uint64_t)t << 20) | ((uint64_t)(max ? 15 : 7) << 39));
+        else emit(l, l->pred | 0x5c40000000000000ull | acc | ((uint64_t)acc << 8) | ((uint64_t)t << 20) | ((uint64_t)lop << 41) |
+                         ((uint64_t)PT << 48));                                                   // LOP OR / XOR
+    }
+    if (sgn) emit(l, l->pred | LOP32I | acc | ((uint64_t)acc << 8) | ((uint64_t)0x80000000u << 20) | ((uint64_t)2 << 53));
+    mov_reg(l, target, acc);
+}
+
 static void lower_r2ur(L *l, const Insn *x) {
     uint32_t target = ur_dst(l, bits(x, 16, 8));
     if (x->w[1] || x->w[2] != 0x000e0000u) return (void)fail(l, "R2UR mode");
@@ -2331,12 +2404,36 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
                  (up(l, bits(x, 84, 3)) << 20) | (up(l, bits(x, 87, 3)) << 23);
         return lower_isetp(l, &y);
     }
+    case 0x09c: return lower_plop3_any(l, x, 1);              // UPLOP3 (the guard above is already in l->pred)
     case 0x087: {                                             // USEL: the condition is a uniform predicate
         Insn y = *x;
         y.w[0] = (x->w[0] & 0xffffu) | (ur_dst(l, bits(x, 16, 8)) << 16) | (ur_in(l, bits(x, 24, 8), 5) << 24);
         if (form == 1) y.w[1] = (x->w[1] & ~0xffu) | ur_in(l, bits(x, 32, 8), 6);
         y.w[2] = (x->w[2] & ~(0x7u << 23) & ~(1u << 27)) | (up(l, bits(x, 87, 3)) << 23);
         return lower_sel(l, &y, 0);
+    }
+    case 0x083: {   // UP2UR URd, UPR, URZ, mask (0x883): bit k of URd is UPk for k in the mask (Lichii lower_to_maxwell.h
+                    // names it; behaviour only)
+        uint32_t mask = x->w[1] & 0x7f, rdr = ur_dst(l, bits(x, 16, 8));
+        if (bits(x, 24, 8) != 63 || (x->w[1] & ~0x7fu)) return (void)fail(l, "UP2UR mode");
+        if (rdr == RZ) return;
+        if (l->up_swap) {                                     // the uniform predicates are bits of up_reg already
+            uint32_t u = up_register(l);
+            if (u != NOREG) lop_imm(l, rdr, u, mask, 0);
+            return;
+        }
+        uint32_t t = S(l, 0), acc = S(l, 1);
+        mov_imm(l, acc, 0);
+        for (uint32_t k = 0; k < 7; k++) {
+            if (!(mask >> k & 1)) continue;
+            uint32_t pk = up(l, k);
+            emit(l, base(l, 0x38e8000000000000ull, t, RZ) | ((uint64_t)(1u << pk) << 20));   // P2R t, PR, RZ, 1 << pk
+            if (pk > k) emit(l, base(l, 0x3828000000000000ull, t, t) | ((uint64_t)(pk - k) << 20));        // SHR
+            else if (pk < k) emit(l, base(l, 0x3848000000000000ull, t, t) | ((uint64_t)(k - pk) << 20));   // SHL
+            emit(l, base(l, 0x5be0000000000000ull, acc, acc) | ((uint64_t)t << 20) | ((uint64_t)0xfc << 28) |
+                        ((uint64_t)RZ << 39) | ((uint64_t)7 << 48));                                    // LOP3 acc | t
+        }
+        return mov_reg(l, rdr, acc);
     }
     case 0x082:                                               // UMOV: register (0xc82, UR at 32-37) or immediate (0x882)
         if (bits(x, 16, 8) == 63 || !ur_has_reg(l, bits(x, 16, 8))) return;   // URZ, or every use forwards
@@ -2461,6 +2558,18 @@ static void lower_lds_sts(L *l, const Insn *x, uint32_t op) {
                 ((uint64_t)offset << 20) | ((uint64_t)size << 48));
 }
 
+// A 64-bit address in r, r+1 as Maxwell takes it, an even-aligned pair: r itself when even, else a copy in the first
+// even-aligned pair of the scratch block (high word first: the copy may start at r + 1 when r is scratch 0).
+static uint32_t even_pair(L *l, uint32_t r) {
+    if (r == NOREG || !(r & 1)) return r;
+    uint32_t e = S(l, 0);
+    if (e & 1) e = S(l, 1);
+    if (S(l, (int)(e - l->scratch_base) + 1) != e + 1) return fail(l, "scratch pair"), NOREG;
+    mov_reg(l, e + 1, r + 1);
+    mov_reg(l, e, r);
+    return e;
+}
+
 // RED (0x98e): global reduction, op 87-89 (Maxwell's numbering), type 73-75 (0 U32, 1 S32, 3 F32), data 32-39,
 // register address pair at 24-31 (RZ: the uniform pair at 64-69), signed 24-bit offset.
 static void lower_red(L *l, const Insn *x) {
@@ -2470,18 +2579,9 @@ static void lower_red(L *l, const Insn *x) {
     int32_t offset = (int32_t)(bits(x, 40, 24) << 8) >> 8;
     if ((x->w[2] & ~variable) != mode || (type != 0 && type != 1 && type != 3) || (type == 3 && operation != 0))
         return (void)fail(l, "RED mode");
-    uint32_t address = uniform ? ur_pair(l, bits(x, 64, 6), 2) : bits(x, 24, 8);
-    if (address != NOREG && address != RZ && (address & 1)) {   // an odd pair: copied to an even one (Maxwell's .E)
-        uint32_t p = S_aligned(l, 0, 2);
-        if (p == RZ) return;
-        mov_reg(l, p, address), mov_reg(l, p + 1, address + 1);
-        address = p;
-    }
-    if (address == NOREG || (address & 1)) {
-        char why[96];
-        snprintf(why, sizeof why, "RED address %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
-        return (void)fail(l, why);
-    }
+    // A uniform pair may map to an odd register pair (the level's light-culling kernels): even_pair copies it.
+    uint32_t address = uniform ? even_pair(l, ur_pair(l, bits(x, 64, 6), 0)) : bits(x, 24, 8);
+    if (address == NOREG || (address & 1)) return (void)fail(l, "RED address");
     emit(l, 0xebf8000000000000ull | l->pred | data | ((uint64_t)address << 8) | ((uint64_t)type << 20) |
                 ((uint64_t)operation << 23) | ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48));
 }
@@ -2495,7 +2595,7 @@ static void lower_atomg(L *l, const Insn *x, uint32_t op) {
         if ((x->w[2] & ~0x07800000u) != 0x001ee100u || operation > 8 || (address & 1)) return (void)fail(l, "ATOMG mode");
     } else {
         if (bits(x, 24, 8) != RZ || (x->w[2] & ~0x3fu & ~0x07800000u) != 0x081ee140u) return (void)fail(l, "ATOMG uniform mode");
-        address = ur_pair(l, bits(x, 64, 6), 2);
+        address = even_pair(l, ur_pair(l, bits(x, 64, 6), 0));
         if (address == NOREG) return;
     }
     emit(l, 0xed00000000000000ull | l->pred | rd | ((uint64_t)address << 8) | ((uint64_t)data << 20) |
@@ -2596,13 +2696,13 @@ static void lower_txd(L *l, const Insn *x) {
 
 // TLD (0xb66 bound, 0xf66 uniform handle): texel fetch at level zero (lod 87-89 = 1) or a level (3); 1D/2D/3D
 // and array 2D; x in Ra and y in Rb for 2D, (x, y) in Ra, Ra+1 and z in Rb for 3D, (layer, x) and y for arrays;
-// the level follows in the Rb list. Maxwell TLD takes the coordinates in Ra.. and the level in Rb (bit 55).
+// the level follows in the Rb list, then the packed texel offsets with AOFFI (bit 76; Mesa NAK sm70_encode.rs OpTld).
+// Maxwell TLD takes the coordinates in Ra.. and in Rb the handle when not bound, the level (bit 55), the offsets
+// (bit 35, Ryujinx InstEmitTexture.EmitTex), in that order.
 static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), rd2 = bits(x, 64, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8);
     uint32_t mask = bits(x, 72, 4), dim = bits(x, 61, 3), tid = bits(x, 40, 14), bank = bits(x, 54, 5), lod = bits(x, 87, 3);
-    int array = dim == 5, volume = dim == 2, level = lod == 3, bindless = op == 0xf66, toff = bits(x, 76, 1);
-    // .AOFFI (76): one register of packed 4-bit offsets after the level in the Rb list, Maxwell's layout (Ryujinx
-    // EmitTex reads it after the level), taken over as it is (the end-of-frame upscale kernel cdba7256, 2026-11-06).
+    int array = dim == 5, volume = dim == 2, level = lod == 3, bindless = op == 0xf66, aoffi = bits(x, 76, 1);
     if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 77, 4) || bits(x, 81, 3) != 7 ||
         (lod != 1 && !level) || bits(x, 59, 1) || mask == 0 || (bindless && (bits(x, 46, 13) || !bits(x, 91, 1))) ||
         (!bindless && bank >= 18))
@@ -2615,14 +2715,14 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     else coords[n++] = ra;
     if (level) lev = (array || volume || dim == 1) ? rb + 1 : rb;
     if (level && dim == 0) lev = rb;
-    uint32_t offs = !toff ? RZ : dim == 0 ? rb + (uint32_t)level : rb + 1 + (uint32_t)level;
+    // The offsets after the level (or where the level would be): the register after the last Rb operand.
+    uint32_t rb_used = (array || volume || dim == 1) + level, off = aoffi ? (rb == RZ ? RZ : rb + rb_used) : RZ;
     int contiguous = coords[0] != RZ;
     for (uint32_t i = 1; i < n; i++) contiguous &= coords[i] == coords[0] + i;
     uint32_t c0 = coords[0];
     if (!contiguous) { for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), coords[i]); c0 = S(l, 0); }
     int bound = !bindless && bank == 2;
-    uint32_t m0 = level ? lev : offs;
-    if (bound && level && toff) mov_reg(l, S(l, 5), lev), mov_reg(l, S(l, 6), offs), m0 = S(l, 5);
+    uint32_t m0 = lev;
     if (!bound) {
         if (bindless) to_reg_into(l, ur_src(l, bits(x, 40, 6)), S(l, 4));
         else {
@@ -2631,7 +2731,11 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
             mov_cbuf(l, S(l, 4), &h);
         }
         if (level) mov_reg(l, S(l, 5), lev);
-        if (toff) mov_reg(l, S(l, 5 + level), offs);
+        if (aoffi) mov_reg(l, S(l, 5 + level), off);
+        m0 = S(l, 4);
+    } else if (aoffi) {                                    // bound: [level,] offsets in scratch 4..
+        if (level) mov_reg(l, S(l, 4), lev);
+        mov_reg(l, S(l, 4 + level), off);
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
@@ -2641,7 +2745,7 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t mdim = array ? 3 : volume ? 4 : dim == 1 ? 2 : 0;
     emit(l, (bound ? 0xdc00000000000000ull : 0xdd00000000000000ull) | l->pred | target | ((uint64_t)c0 << 8) | ((uint64_t)m0 << 20) |
                 ((uint64_t)mdim << 28) | ((uint64_t)mask << 31) | ((uint64_t)(bound ? tid : 0) << 36) | ((uint64_t)bits(x, 90, 1) << 49) |
-                ((uint64_t)7 << 51) | ((uint64_t)level << 55) | ((uint64_t)toff << 35));
+                ((uint64_t)7 << 51) | ((uint64_t)level << 55) | ((uint64_t)aoffi << 35));
     if (direct) return;
     for (uint32_t i = 0; i < components; i++) {
         uint32_t t = (!split || i < 2) ? (rd == RZ ? RZ : rd + i) : rd2 + (i - 2);
@@ -2661,7 +2765,7 @@ static void lower_imad_hi(L *l, const Insn *x) {
     emit(l, base(l, 0x5a00000000000000ull, rd, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)rc << 39) | sign | ((uint64_t)1 << 54));
 }
 
-// IABS (0x013): max(x, -x), signed.
+// IABS (0x013): max(x, -x), signed; b a register, an immediate or a constant (to_reg).
 static void lower_iabs(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8);
     if (x->w[2] || bits(x, 24, 8)) return (void)fail(l, "IABS mode");
@@ -2700,15 +2804,47 @@ static void lower_bra(L *l, const Insn *x) {
     emit(l, 0xe24000000000000full | p);
 }
 
+// Task (6) and mesh (7) programs end in one epilogue the translator expands (docs/mesh.md): their outputs are copied
+// to the stage's outputs there, once per workgroup, so an EXIT becomes a branch to it (the end of the program, where
+// the marker is emitted before the final EXIT).
+static int mesh_stage(const L *l) { return l->stage == 6 || l->stage == 7; }
+
 static void lower_exit(L *l, const Insn *x) {
     uint32_t pc = bits(x, 87, 4);
     if (bits(x, 84, 2)) return (void)fail(l, "EXIT mode");
+    if (mesh_stage(l)) {
+        if (pc != 7) {   // @Pg EXIT Pc: both must hold, as in lower_bra
+            if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
+            reloc(l, l->n);
+            emit(l, 0xe24000000000000full | ((uint64_t)pc << 16));
+            return;
+        }
+        reloc(l, l->n);
+        emit(l, 0xe24000000000000full | l->pred);
+        return;
+    }
     if (pc != 7) {
         if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
         emit(l, 0xe30000000000000full | ((uint64_t)pc << 16));
         return;
     }
     emit(l, 0xe30000000000000full | l->pred);
+}
+
+// ISBERD (0x923) / ISBEWR (0x927): the stage buffer of task and mesh programs (docs/mesh.md), passed to the
+// translator as one pseudo instruction (sm86_lower.h SM86_ISBE_*) that keeps every field: what a space means depends
+// on the stage (a TASK read at 0 is the mesh workgroup index, a TASK write at 4 the mesh count, ...), which only the
+// translator's expansion knows. ISBERD: Rd 16-23; ISBEWR: the data register in w1 & 0xff; both: the address register
+// 24-31, the byte offset w1 >> 8, the space 75-78.
+static void lower_isbe(L *l, const Insn *x, int write) {
+    uint32_t reg = write ? (x->w[1] & 0xff) : bits(x, 16, 8), ra = bits(x, 24, 8), offset = x->w[1] >> 8;
+    uint32_t space = bits(x, 75, 4);
+    if (!mesh_stage(l)) return (void)fail(l, "ISBE outside a task or mesh program");
+    if (space != 0xf && space != 7 && space != 1 && space != 0) return (void)fail(l, "ISBE space");
+    if (!write && (space == 1 || space == 0)) return (void)fail(l, "ISBERD from the primitive map");
+    if (write ? bits(x, 16, 8) != 0 : (x->w[1] & 0xff) != 0) return (void)fail(l, "ISBE mode");
+    emit(l, SM86_ISBE_OP | l->pred | (uint64_t)reg | ((uint64_t)ra << 8) | ((uint64_t)(offset & 0xffffff) << 20) |
+                ((uint64_t)space << 44) | ((uint64_t)write << 48));
 }
 
 // CALL.REL.NOINC pushes no return address: the compiler uses it predicated to skip the next instruction (a
@@ -2752,6 +2888,52 @@ static void lower_brx(L *l, const Insn *x, uint32_t op) {
 
 static void lower_one_inner(L *l, const Insn *x);
 
+// The register of the uniform predicates in swap mode (bit n = UPn), made on first use.
+static uint32_t up_register(L *l) {
+    if (!l->up_reg) {
+        l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
+        if (l->up_reg == NOREG) return fail(l, "no general register free for the uniform predicates"), NOREG;
+    }
+    return l->up_reg;
+}
+
+// PLOP3 in swap mode when an ordinary input has the number of a uniform predicate the instruction names (the swap
+// cannot hold both in Pn; the level's tile loops test P0 against UP0): the table on registers. P2R copies the
+// ordinary predicates out, up_reg holds the uniform ones; each input's bit is shifted to bit pd, one LOP3 applies the
+// table (negations and PT inputs folded into it), R2P writes bit pd into Pd under the instruction's guard.
+static void lower_plop3_regs(L *l, const Insn *x) {
+    uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), lut = bits(x, 64, 3) | (bits(x, 72, 5) << 3);
+    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, "PLOP3 mode");
+    if (pd == 7) return;
+    uint32_t in[3] = {bits(x, 87, 4), bits(x, 77, 4), bits(x, 68, 4)};
+    int uni[3] = {0, 0, (int)bits(x, 67, 1)};
+    uint32_t pr = S(l, 0), upr = uni[2] ? up_register(l) : RZ, r[3];
+    if (l->failed) return;
+    emit(l, 0x38e8000000070000ull | pr | ((uint64_t)RZ << 8) | ((uint64_t)0x7f << 20));   // P2R pr, PR, RZ, 0x7f
+    for (int i = 0; i < 3; i++) {
+        uint32_t w = 1u << (2 - i), t = 0;                    // the input's weight in the table index
+        if (in[i] & 8) {                                      // negated: the table read at the other value
+            for (uint32_t v = 0; v < 8; v++) t |= (lut >> (v ^ w) & 1) << v;
+            lut = t, t = 0;
+        }
+        uint32_t pos = in[i] & 7;
+        if (pos == 7) {                                       // PT: constant 1, read as RZ (0): the table at 1 for 0
+            for (uint32_t v = 0; v < 8; v++) t |= (lut >> (v | w) & 1) << v;
+            lut = t, r[i] = RZ;
+            continue;
+        }
+        uint32_t src = uni[i] ? upr : pr;
+        r[i] = S(l, 1 + i);
+        if (pos > pd) emit(l, base(l, 0x3828000000000000ull, r[i], src) | ((uint64_t)(pos - pd) << 20));        // SHR
+        else if (pos < pd) emit(l, base(l, 0x3848000000000000ull, r[i], src) | ((uint64_t)(pd - pos) << 20));   // SHL
+        else mov_reg(l, r[i], src);
+    }
+    uint32_t t = S(l, 4);
+    emit(l, base(l, 0x5be0000000000000ull, t, r[0]) | ((uint64_t)r[1] << 20) | ((uint64_t)lut << 28) |
+                ((uint64_t)r[2] << 39) | ((uint64_t)7 << 48));
+    emit(l, 0x38f0000000000000ull | l->pred | ((uint64_t)t << 8) | ((uint64_t)(1u << pd) << 20));   // R2P PR, t, 1 << pd
+}
+
 static void lower_one(L *l, const Insn *x) {
     uint32_t p = bits(x, 12, 4);
     if (p == 15) return;                                      // @!PT
@@ -2771,13 +2953,10 @@ static void lower_one(L *l, const Insn *x) {
             if (a != 7) rd |= 1u << a;
             if (b != 7) rd |= 1u << b;
             if (!bits(x, 67, 1) && bits(x, 68, 3) != 7) rd |= 1u << bits(x, 68, 3);
-            if (rd & swap) return (void)fail(l, "PLOP3 reads the predicate a uniform one is swapped into");
+            if (rd & swap) return lower_plop3_regs(l, x);   // no swap: the table on registers
         }
         uint32_t keep = swap & ~wr;
-        if (!l->up_reg) {
-            l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
-            if (l->up_reg == NOREG) return (void)fail(l, "no general register free for the uniform predicates");
-        }
+        if (up_register(l) == NOREG) return;
         uint32_t save = S(l, 7);
         emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)swap << 20));
         emit(l, 0x38f0000000070000ull | ((uint64_t)l->up_reg << 8) | ((uint64_t)swap << 20));
@@ -2800,6 +2979,9 @@ static void lower_one_inner(L *l, const Insn *x) {
     switch (op) {
     case 0x947: return lower_bra(l, x);
     case 0x94d: return lower_exit(l, x);
+    case 0x923: return lower_isbe(l, x, 0);
+    case 0x59f: return lower_sured(l, x);
+    case 0x927: return lower_isbe(l, x, 1);
     case 0x918: case 0x91a: case 0x945: case 0x941: case 0x942: case 0x948: return;   // NOP, DEPBAR, BSSY, BSYNC, BREAK, WARPSYNC
     case 0x95b:
         if (x->w[1] || x->w[2] != 0x03800000u) return (void)fail(l, "KILL mode");
@@ -2836,6 +3018,8 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x301: return lower_brev(l, x);
     case 0x230: case 0x430: case 0x630: return lower_hadd2(l, x, op);
     case 0x326: return lower_ipa(l, x);
+    case 0x526: return lower_ipa_idx(l, x);
+    case 0x243: return lower_fchk(l, x);
     case 0x321: return lower_ald_ast(l, x, 0);
     case 0x322: return lower_ald_ast(l, x, 1);
     case 0xb82: return lower_ldc(l, x);
@@ -2849,9 +3033,9 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0xb97: return lower_suld(l, x);
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
-    case 0x240: return lower_hmnmx2(l, x, op);
     case 0x234: case 0x434: return lower_hsetp2(l, x, op);
-    case 0x232: case 0x832: case 0xa32: return lower_hmul2(l, x, op);
+    case 0x232: case 0x432: case 0x832: case 0xa32: return lower_hmul2(l, x, op);
+    case 0x240: return lower_hmnmx2(l, x, op);
     case 0xb1d: return lower_bar(l, x);
     case 0x83b: return lower_ldsm(l, x);
     case 0x23c: return lower_hmma(l, x);
@@ -2867,7 +3051,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x98e: return lower_red(l, x);
     case 0x3a8: case 0x9a8: return lower_atomg(l, x, op);
     case 0x227: case 0x827: case 0xa27: return lower_imad_hi(l, x);
-    case 0x213: case 0x813: case 0xa13: return lower_iabs(l, x);   // register, immediate, constant (the 6x1x1 kernel before the fog)
+    case 0x213: case 0x813: case 0xa13: return lower_iabs(l, x);   // register, immediate, constant b
     case 0x803: return lower_p2r_r2p(l, x, 0);
     case 0x804: return lower_p2r_r2p(l, x, 1);
     case 0x81c: return lower_plop3(l, x);
@@ -2945,10 +3129,12 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
     }
     L l = {0};
     l.stage = c.stage;
-    l.graphics = c.stage != 5;
+    // Task and mesh programs are translated as compute (docs/mesh.md): no header in the output, addresses from 0; their
+    // input still has the SM86 header.
+    l.graphics = c.stage != 5 && c.stage != 6 && c.stage != 7;
     l.tensor = tensor && !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0;
     l.control = control, l.ctl_size = c.size, l.c1 = code + c.c1_off, l.c1_len = c.c1_len;
-    uint32_t header = l.graphics ? SM86_HEADER : 0;
+    uint32_t header = c.stage == 5 ? 0 : SM86_HEADER;
     l.in = (const Insn *)(code + header);
     l.n = (c.code_end - header) / 16;
     if (l.n == 0 || l.n > 65536) { snprintf(out->error, sizeof out->error, "program size"); return 0; }
@@ -2996,6 +3182,7 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         }
     }
     l.first_out[l.n] = l.nout;
+    if (!l.failed && mesh_stage(&l)) emit(&l, SM86_MESH_EPILOGUE);   // task and mesh EXITs branch here (lower_exit)
     if (!l.failed) emit(&l, 0xe30000000007000full);          // a branch past the end lands on an EXIT
     // Relocations.
     for (uint32_t i = 0; i < l.nreloc && !l.failed; i++) {

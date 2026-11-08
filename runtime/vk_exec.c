@@ -825,6 +825,11 @@ static int split_n = -1, split_draws, part_start;
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs;
 
+// OOT_FENCE_TRACE (vk_sync.c's watchdog): the op the replay is inside, so a stall names it.
+volatile long long vk_exec_cur_op = -1;
+volatile long long vk_exec_cur_fence = -1;
+int vk_exec_trace_on;   // set by vk_sync.c when OOT_FENCE_TRACE is on: gates the two stores in walk()
+
 static void maybe_split(VkExec *ex) {
     if (split_n < 0) {
         split_n = cfg_int("OOT_SPLIT_DRAWS");
@@ -851,6 +856,10 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
+        if (vk_exec_trace_on) {   // OOT_FENCE_TRACE: the watchdog in vk_sync.c names a stalled op
+            __atomic_store_n(&vk_exec_cur_op, (long long)h->op, __ATOMIC_RELAXED);
+            __atomic_store_n(&vk_exec_cur_fence, (long long)ex->fence, __ATOMIC_RELAXED);
+        }
         if (!skip_ops_parsed) skip_ops_init();
         const int skipped = skip_ops[h->op] && h->op != OP_END && h->op != OP_BEGIN && h->op != OP_JUMP && h->op != OP_CALL;
         {   // the op trace (vk_exec_fault_ops): the op, its submission and its first payload words
@@ -924,7 +933,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
         case OP_BARRIER: vk_exec_barrier(ex); break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
-        case OP_DRAW_IND: case OP_PUSH_CC:
+        case OP_DRAW_IND: case OP_PUSH_CC: case OP_DRAW_MESH:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DRAW_IND) vk_exec_frame.draws_seen++, split_draws++;
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
             if (h->op != OP_UPDATE_UB && !ex->in_pass && vk_crumbs_ops() && ex->cb) {   // OOT_CRUMBS=ops: what a device loss names
@@ -1010,6 +1019,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
+    vk_exec_pool_feedback(ex);               // pool sets: the sampled texture ids, for the host (vk_exec_draw.c)
     if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);

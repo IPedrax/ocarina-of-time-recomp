@@ -268,8 +268,22 @@ Open, in order:
   the level runs (662 frames, A/B against the old rule: device lost after 14) and the Deku Tree's dialogue plays
   (subtitles over a still black scene). Also translator patch 0018: NMin/NMax/NClamp and a saturating, NaN-to-0 F2I,
   as Maxwell defines them (not the cause, but SPIR-V left them undefined).
-- The scene behind the dialogue is black: 474 graphics texture slots of the dumped level frame read no handle
-  (as the compute ones did; check the graphics side of the bank-0 and bindless handle paths first).
+- The scene behind the dialogue was black for two reasons (2026-11-06, dumps of frame 1500 with
+  `OOT_DUMP_SKIP_RUNS=1`; the dump's pass cap is now 1200 and it notes draws and dispatches skipped for a missing
+  shader, with the code hash `tools/kernel.py` prints):
+  - The last steps of the frame, the 1080p-to-1440p kernel 0a9afab0 and the kernel after it 7034cdb8, did not
+    lower; the frame showed only the subtitles drawn over an empty target. The lowering now has SULD (23 level
+    kernels), REDUX (27), HSETP2, HMUL2, negated HMNMX2 operands and TLD4 with per-tap offsets and fp16 results.
+    With them the level shows: the sky and the forest's shapes (`build/logs/level-up.png`), the geometry still
+    mostly black.
+  - The volumetric fog: kernel 1a62084a (8x4x4 groups, the 64x36x96 in-scattering volumes) writes only 0 and NaN,
+    and the integration along depth and the fog's full-screen pass carry the NaN into every pixel of the scene.
+    Its uniform blocks, textures and storage buffers are bound and plausible; the cause is open.
+    `OOT_SKIP_CS=1a62084a` leaves the fog out for now.
+  - The materials: most fragment shaders take their texture handles from memory (bindless: a handle loaded into a
+    register, R2UR, then TEX through a uniform register), which Ryujinx 1.3.2 cannot resolve; they sample the
+    placeholder. True bindless (a descriptor array over the texture pool, indexed in the shader) is the next big
+    piece.
 - 605 programs the lowering refuses in the level (`gfx_shader: translation failed`), so about 280 of 744 draws are
   skipped: unknown opcodes 261, `TEX unpacked operands` 128, scratch and predicate pressure 53, `RED address` 37,
   uniform datapath opcodes 35, and smaller groups (TLD, TLD4, HMNMX2, PLOP3, STG of wide zeros).
@@ -281,6 +295,49 @@ Open, in order:
   once the game has sent its end buffer, one black picture stamped with the last sample's time, then the end; the
   quick route (`tools/run.py --replay build/logs/a-spam.txt --skip-movies`) reaches the level in about 75 s.
   The game has no button to skip the opening (the user).
+
+## Status (2026-11-06, evening): the level's programs lower, the scene is still black
+
+Worked offline: the cache keeps every refused program as `<key>.fail.ctl` / `.fail.code`, and lowering those (and the
+stored inputs `in/*.in`, to catch regressions) with `build/tools/sm86_lower` takes seconds, against minutes per game
+run. Of the 64 translation keys the level route refused (28 distinct programs), 62 lower now (commits 73ea4d7,
+913bbfb): IMAD.WIDE and uniform-base loads with less scratch (the six vertex shaders near R255), PLOP3 and UPLOP3
+over any PSETP-computable table (and a fix: the outer PSETP slot held the wrong input), RED and ATOMG on odd uniform
+pairs, PLOP3 against swapped uniform predicates through registers, indexed IPA, FCHK (always the fast path), TLD with
+texel offsets, LEA with a negated addend, stores of wide zeros, IABS with constant operands. The water renders now
+(`build/logs/level-lower2.png`, run 359); the rest of the geometry is still flat black or white.
+
+Left on the route: a fragment shader's TEX with bit 60 clear (NAK's `.scr`; its operand layout is not known here) and
+an unknown opcode 0x19f in a compute kernel.
+
+**Then the frame dump** (`--dump 900`, `build/logs/dump-361`): the level is a forward renderer. Pass 136 is a depth
+prepass (217 draws, colour masked: `chmask 0`) that covers the whole view; pass 168 is the colour pass (112 draws,
+depth EQUAL without a write) into the r11g11b10f HDR target, and its draws look right where they land (bark and
+moss textured, `pass_0168_t0_..._tm.png`), but most of the scene, the ground among it, is missing there. Relaxing
+EQUAL to LEQUAL changed nothing visible, so it is not depth invariance. The missing geometry is drawn with **mesh
+shaders**: the run calls `nvnCommandBufferDrawMeshTasksIndirect` thousands of times (a stub; `nvn_procs.c` now logs a
+stub's call count at powers of two) and the game's programs come in four stage sets by control byte +0x56 (now logged
+once each by `nvn_api_obj.c prog_set_shaders`): vertex + fragment (0 1), compute (5), and **7 + fragment** and
+**6 + 7 + fragment**: mesh (7) and task (6) programs. So the next piece is the mesh stages, not more of the lowering.
+Neither the translator (Ryujinx 1.3.2 has no mesh or task stage) nor the replay supports them today; the two ways are
+VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the translator) or running task and mesh
+programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
+hand-off for it.
+
+## Status (2026-11-07): the level's frame rate is one kernel
+
+`OOT_CS_TIME=1` on the level route (run 398): one compute kernel, input id `ace1cec038d64d1f` (code hash
+`80fb2f9325762992`, 8x8 threads over 64x64 groups: one thread per pixel of a 512x512 target), takes 1578 ms of GPU
+time per dispatch, 99.9% of the frame's compute; everything else is below 0.4 ms. Skipping it
+(`OOT_SKIP_CS=1a62084a,ace1cec0`, run 405) takes the GPU from about 450 ms to 10.5 ms a frame: 58 fps in the first
+minute, the replay script reaches a cutscene (a Kokiri and Navi, textured and lit, `build/logs/level-noace.png`), the
+background dark. Its first loop (0x900-0xcf0) runs over 0x30-byte records of the storage buffer at bank 0 + 0x60
+(NVN2 table slot 0; in the dump `build/logs/dump-ace`, 0x18040 bytes: a 0x40-byte header and room for 2048
+records), sampling a texture each, up to the count at the buffer's + 4 (`LD R3, [UR4 + 0x4]`); later loops are
+bounded by word 0 of uniform blocks 4-7, zero in the dump. Two of its four textures resolve to the 4x4 default
+texture (bank 0 + 0x80, + 0x88). Next: the count it reads (the readback `OOT_CS_READBACK=<frame>,all,dims=64x64x1`
+did not catch its buffer, so it may not go through `ssbo_info`), and whether its record buffer and textures are the
+right ones. Until then, `OOT_SKIP_CS=1a62084a,ace1cec0` gives a playable frame rate on the level for testing.
 
 ## Status (2026-11-06, the start-up crash): two host threads on one fiber stack
 

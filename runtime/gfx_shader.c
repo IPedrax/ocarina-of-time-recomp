@@ -56,7 +56,7 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 25                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 26                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs); translator changes are covered by its identity
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
@@ -570,7 +570,8 @@ static int reflection_valid(const char *res, uint64_t size) {
     const char *st = strstr(b, "\"stage\"");
     if (!st) return 0;
     st = strchr(st + 7, '"');
-    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
+    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4) ||
+                  !strncmp(st, "\"ts\"", 4) || !strncmp(st, "\"ms\"", 4));   // task and mesh (docs/mesh.md)
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -707,7 +708,9 @@ static int handle_slot(int kind, int cbuf_slot, int handle, int separate) {
 static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     GfxShaderRes *r = &s->res[kind][s->nres[kind]++];
     r->set = 0;
-    r->binding = (uint16_t)json_int(o, e, "binding", 0);
+    long binding = json_int(o, e, "binding", 0);
+    if (binding < 0 || binding > 0xffff) rt_fatal("gfx_shader: binding %ld beyond the 16 bits reflection keeps", binding);
+    r->binding = (uint16_t)binding;
     if (kind == GFX_RES_UBO || kind == GFX_RES_SSBO) {
         r->slot = (int16_t)json_int(o, e, "slot", -1);
         r->count = 1;
@@ -730,6 +733,141 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->count = (uint16_t)json_int(o, e, "array", 1);
     r->separate = sep && *sep == 't';
     r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
+    // A pool array (BindlessElimination: TextureHandle.PackOffsets(0, 0, Direct) in constant buffer 0) gets its pool
+    // set binding; storage images, buffer textures and multisampled arrays from a pool are not supported yet and
+    // keep the placeholder.
+    if (r->cbuf_slot == 0 && handle == 0x40000000) {
+        r->bindless = 1;
+        int base = r->type & 0xff, arr = (r->type & 0x100) != 0, b = -1;
+        if (kind == GFX_RES_TEX && !(r->type & 0x200)) {
+            if (base == 0) b = GFX_POOL_SAMPLER;
+            else if (base == 1) b = arr ? GFX_POOL_1D_ARRAY : GFX_POOL_1D;
+            else if (base == 3) b = arr ? GFX_POOL_2D_ARRAY : GFX_POOL_2D;
+            else if (base == 4) b = GFX_POOL_3D;
+            else if (base == 5) b = arr ? GFX_POOL_CUBE_ARRAY : GFX_POOL_CUBE;
+        }
+        if (b >= 0) r->pool = (uint8_t)(b + 1), r->count = 1;
+        else {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 4)
+                rt_log("gfx_shader: a pool-indexed %s of type %#x is not supported: it reads the placeholder",
+                       kind == GFX_RES_IMG ? "image" : "texture", r->type);
+        }
+    }
+}
+
+// Sampling feedback (gfx.h GFX_POOL_FEEDBACK): declares the feedback buffer (a BufferBlock struct of a runtime uint array
+// in the Uniform storage class, as Ryujinx declares storage buffers in SPIR-V 1.3) at set GFX_POOL_SET and stores 1 at
+// the texture id after every access chain into the texture arrays vars[0..nv). Every invocation stores the same value,
+// so the races are harmless, and a warp with one id makes one store. The uint type is reused (SPIR-V forbids a second
+// OpTypeInt 32 0); pointers, arrays and structs may repeat.
+static void add_pool_feedback(GfxShader *s, const uint32_t *vars, int nv) {
+    enum { OP_TYPE_INT_ = 21, OP_TYPE_RUNTIME_ARRAY = 29, OP_TYPE_STRUCT = 30, OP_TYPE_POINTER_ = 32, OP_CONSTANT_ = 43,
+           OP_FUNCTION = 54, OP_VARIABLE_ = 59, OP_STORE = 62, OP_ACCESS_CHAIN = 65, OP_DECORATE_ = 71,
+           OP_MEMBER_DECORATE = 72, SC_UNIFORM = 2, DEC_BUFFER_BLOCK = 3, DEC_ARRAY_STRIDE = 6, DEC_BINDING = 33,
+           DEC_DESCRIPTOR_SET = 34, DEC_OFFSET = 35 };
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words, ann_end = 0, fn_at = 0, nacc = 0;
+    uint32_t bound = w[3], uint_t = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) return;
+        if (!fn_at) {
+            if (op == OP_TYPE_INT_ && len >= 4 && w[i + 2] == 32 && w[i + 3] == 0 && !uint_t) uint_t = w[i + 1];
+            else if (op == OP_DECORATE_ || op == OP_MEMBER_DECORATE || op == 73 || op == 74 || op == 75 || op == 332 ||
+                     op == 5632 || op == 5633)
+                ann_end = i + len;
+            else if (op == OP_FUNCTION) fn_at = i;
+        }
+        if (fn_at && op == OP_ACCESS_CHAIN && len >= 5)
+            for (int k = 0; k < nv; k++) nacc += w[i + 3] == vars[k];
+        i += len;
+    }
+    if (!nacc || !ann_end || !fn_at || ann_end > fn_at) return;
+    uint32_t ut = uint_t ? uint_t : bound++, rta = bound++, st = bound++, pst = bound++, pu = bound++, c0 = bound++,
+             c1 = bound++, fb = bound++;
+    uint32_t dec[] = {4u << 16 | OP_DECORATE_, rta, DEC_ARRAY_STRIDE, 4,
+                      3u << 16 | OP_DECORATE_, st, DEC_BUFFER_BLOCK,
+                      5u << 16 | OP_MEMBER_DECORATE, st, 0, DEC_OFFSET, 0,
+                      4u << 16 | OP_DECORATE_, fb, DEC_DESCRIPTOR_SET, GFX_POOL_SET,
+                      4u << 16 | OP_DECORATE_, fb, DEC_BINDING, GFX_POOL_FEEDBACK};
+    uint32_t typ[40], nt = 0;
+    if (!uint_t) typ[nt++] = 4u << 16 | OP_TYPE_INT_, typ[nt++] = ut, typ[nt++] = 32, typ[nt++] = 0;
+    uint32_t rest[] = {3u << 16 | OP_TYPE_RUNTIME_ARRAY, rta, ut,
+                       3u << 16 | OP_TYPE_STRUCT, st, rta,
+                       4u << 16 | OP_TYPE_POINTER_, pst, SC_UNIFORM, st,
+                       4u << 16 | OP_TYPE_POINTER_, pu, SC_UNIFORM, ut,
+                       4u << 16 | OP_CONSTANT_, ut, c0, 0,
+                       4u << 16 | OP_CONSTANT_, ut, c1, 1,
+                       4u << 16 | OP_VARIABLE_, pst, fb, SC_UNIFORM};
+    memcpy(typ + nt, rest, sizeof rest), nt += sizeof rest / 4;
+    uint64_t total = n + sizeof dec / 4 + nt + nacc * 9;
+    uint32_t *o = malloc(total * 4), *q = o;
+    if (!o) rt_fatal("gfx_shader: out of memory");
+    memcpy(q, w, ann_end * 4), q += ann_end;
+    memcpy(q, dec, sizeof dec), q += sizeof dec / 4;
+    memcpy(q, w + ann_end, (fn_at - ann_end) * 4), q += fn_at - ann_end;
+    memcpy(q, typ, nt * 4), q += nt;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16, hit = 0;
+        memcpy(q, w + i, len * 4), q += len;
+        if (op == OP_ACCESS_CHAIN && len >= 5)
+            for (int k = 0; k < nv; k++) hit |= w[i + 3] == vars[k];
+        if (hit) {
+            uint32_t ptr = bound++;
+            *q++ = 6u << 16 | OP_ACCESS_CHAIN, *q++ = pu, *q++ = ptr, *q++ = fb, *q++ = c0, *q++ = w[i + 4];
+            *q++ = 3u << 16 | OP_STORE, *q++ = ptr, *q++ = c1;
+        }
+        i += len;
+    }
+    o[3] = bound;
+    free(s->spirv);
+    s->spirv = o, s->words = (uint64_t)(q - o);
+    // OOT_POOL_SPV_DUMP=1 (diagnostic): the first 8 patched modules go to <cache>\pool-fb-<n>.spv, for spirv-val
+    static volatile LONG dumped;
+    const char *dump = cfg_get("OOT_POOL_SPV_DUMP");
+    if (dump && *dump == '1' && cache_dir[0]) {
+        LONG k = InterlockedIncrement(&dumped);
+        char path[PATH_CAP + 32];
+        snprintf(path, sizeof path, "%s\\pool-fb-%ld.spv", cache_dir, k);
+        if (k <= 8) write_file(path, s->spirv, s->words * 4);
+    }
+}
+
+// Moves the pool arrays (GfxShaderRes.pool) to set GFX_POOL_SET, at their view type's binding, by rewriting their
+// DescriptorSet and Binding decorations in place (same length), then adds the sampling feedback. Run on every load
+// (a module comes from disk with set 0), before anything reads the bindings.
+static void move_pool_arrays(GfxShader *s) {
+    const GfxShaderRes *r = s->res[GFX_RES_TEX];
+    int from[GFX_POOL_BINDINGS], to[GFX_POOL_BINDINGS], n = 0;
+    for (int i = 0; i < s->nres[GFX_RES_TEX] && n < GFX_POOL_BINDINGS; i++)
+        if (r[i].pool) from[n] = r[i].binding, to[n++] = r[i].pool - 1;
+    if (!n || s->words < 6) return;
+    uint32_t *w = s->spirv, bound = w[3];
+    uint64_t *bind_at = calloc(bound, sizeof *bind_at), *set_at = calloc(bound, sizeof *set_at);   // word index + 1
+    if (!bind_at || !set_at) rt_fatal("gfx_shader: out of memory");
+    for (uint64_t i = 5; i < s->words;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > s->words) break;
+        if (op == 71 && len >= 4 && w[i + 1] < bound) {   // OpDecorate
+            if (w[i + 2] == 33) bind_at[w[i + 1]] = i + 4;   // Binding
+            else if (w[i + 2] == 34) set_at[w[i + 1]] = i + 4;   // DescriptorSet
+        }
+        i += len;
+    }
+    uint32_t tex_vars[GFX_POOL_BINDINGS];
+    int ntv = 0;
+    for (uint32_t id = 0; id < bound; id++) {
+        if (!bind_at[id] || !set_at[id] || w[set_at[id] - 1] != 0) continue;
+        for (int k = 0; k < n; k++)
+            if (w[bind_at[id] - 1] == (uint32_t)from[k]) {
+                w[set_at[id] - 1] = GFX_POOL_SET, w[bind_at[id] - 1] = (uint32_t)to[k];
+                if (to[k] != GFX_POOL_SAMPLER && ntv < GFX_POOL_BINDINGS) tex_vars[ntv++] = id;
+                break;
+            }
+    }
+    free(bind_at), free(set_at);
+    if (ntv) add_pool_feedback(s, tex_vars, ntv);
 }
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).
@@ -801,7 +939,8 @@ static void reflect(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : !strcmp(stage, "ts") ? GFX_STAGE_TS
+             : !strcmp(stage, "ms") ? GFX_STAGE_MS : GFX_STAGE_VS;
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
@@ -820,6 +959,7 @@ static void reflect(GfxShader *s) {
         }
         s->c1_len = s->c1 ? (uint32_t)n : 0;
     }
+    move_pool_arrays(s);
     reflect_spirv(s);
 }
 
@@ -1091,8 +1231,31 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
     rt_sha256(buf, (size_t)(p - buf), key);
 }
 
+// A task or mesh program's job fields (tools/xlate/Program.cs, docs/mesh.md), from its control section and the code
+// header before the first instruction: the maximum vertices and primitives (control +0x60), the payload (the top byte
+// of +0x58: 1 KiB per 4), and the output lines: each enabled component of the header's VTG output map from byte 0x34
+// in order (system values A, then B, whose bits 4-7 are the position, then a nibble per generic vector), as its target
+// (0-3 position x-w, 4 + location * 4 + component, -1 not carried). The stage buffer goes after the program's own
+// shared memory (none in the game's programs; control +0x50 is local memory).
+typedef struct { uint32_t max_v, max_p, payload_words, nlines, base, bytes; int16_t lines[160]; } MeshJob;
+static void mesh_job(int stage, const uint8_t *control, const uint8_t *code, uint32_t own_shared, MeshJob *m) {
+    uint32_t w60, w58;
+    memcpy(&w60, control + 0x60, 4), memcpy(&w58, control + 0x58, 4);
+    memset(m, 0, sizeof *m);
+    m->max_v = w60 & 0xffff, m->max_p = w60 >> 16, m->payload_words = (w58 >> 24) / 4 * 256;
+    if (stage == GFX_STAGE_MS) {
+        for (int bit = 0; bit < 8; bit++) if (code[0x34] >> bit & 1 && m->nlines < 160) m->lines[m->nlines++] = -1;
+        for (int bit = 0; bit < 8; bit++) if (code[0x35] >> bit & 1 && m->nlines < 160) m->lines[m->nlines++] = (int16_t)(bit >= 4 ? bit - 4 : -1);
+        for (int vec = 0; vec < 32; vec++)
+            for (int c = 0; c < 4; c++)
+                if (code[0x36 + vec / 2] >> (4 * (vec & 1)) & 1 << c && m->nlines < 160) m->lines[m->nlines++] = (int16_t)(4 + vec * 4 + c);
+    }
+    m->base = (own_shared + 15) & ~15u;
+    m->bytes = stage == GFX_STAGE_MS ? (m->max_v * m->nlines * 4 + 4 + 3 * m->max_p + 3) & ~3u : 0x10 + m->payload_words * 4;
+}
+
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl, const MeshJob *mesh) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
@@ -1128,7 +1291,14 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         o += sprintf(o, "},\"fout\":{");
         for (int i = 0; i < 8; i++)
             if (a->frag_out_type[i]) o += sprintf(o, "%s\"%d\":\"%s\"", sep, i, attr_name(a->frag_out_type[i])), sep = ",";
-        o += sprintf(o, "},\"shared\":%u", a->shared_bytes);
+        o += sprintf(o, "},\"shared\":%u", mesh ? mesh->base + mesh->bytes : a->shared_bytes);
+    }
+    if (mesh) {
+        if (!a) o += sprintf(o, ",\"shared\":%u", mesh->base + mesh->bytes);
+        o += sprintf(o, ",\"local\":[32,1,1],\"mesh\":{\"max_vertices\":%u,\"max_primitives\":%u,\"base\":%u,\"payload_words\":%u,\"lines\":[",
+                     mesh->max_v, mesh->max_p, mesh->base, mesh->payload_words);
+        for (uint32_t i = 0; i < mesh->nlines; i++) o += sprintf(o, "%s%d", i ? "," : "", mesh->lines[i]);
+        o += sprintf(o, "]}");
     }
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};
@@ -1211,7 +1381,8 @@ typedef struct {
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
     (void)c1;
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs"
+                  : stage == GFX_STAGE_TS ? "ts" : stage == GFX_STAGE_MS ? "ms" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     if (!control || !sm86_control_parse(control, CONTROL_BOUND, &r->ctl)) return fail("bad control section", NULL), 0;
     r->length = r->ctl.code_size;
@@ -1413,7 +1584,10 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)low.c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return sm86_lower_free(&low), plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl);
+    MeshJob mj;
+    int mesh = stage == GFX_STAGE_TS || stage == GFX_STAGE_MS;
+    if (mesh) mesh_job(stage, control, code, a ? a->shared_bytes : 0, &mj);
+    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl, mesh ? &mj : NULL);
     sm86_lower_free(&low);
     int ok = svc_request(req, reply, sizeof reply);
     free(req);
@@ -2119,7 +2293,7 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     if (n < 0) return 1;
     uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
     static const uint8_t zero[32];
-    size_t u = 0, by[3] = {0}, stages[6] = {0};
+    size_t u = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
     for (long long i = 0; recs && i < n; i++) {           // seed records come in priority order: the first id wins
         if (!memcmp(iid[i], zero, 32) || !set_add(&seen, hash8(iid[i]))) continue;

@@ -31,11 +31,38 @@ As of 2026-11-06 (details and dates in [docs/plan.md](docs/plan.md), the shader 
   60 fps. Next: the 656 skinning vertex shaders the lowering still
   refuses (register pressure), the mesh stages, and whatever lies past the cinematic.
 
-Builds run with Windows Python and MSYS2 Clang (`tools/build_game.py`), the shader translator with .NET
-(`tools/build_xlate.py`); see the plan for the set-up.
-
 This repository contains no game content. You need your own dump of the game and the keys from your own console. The
 content check (`tools/check_content.py`, run by the pre-commit hook and CI) keeps it that way.
+
+## Building
+
+The game is not playable yet (see Status); these steps build what there is. Commands are shown for Windows; from WSL
+the same scripts run (the build itself still uses Windows Python and MSYS2 through interop).
+
+Needs:
+
+- Python 3.14 or later for the extraction (its standard library reads zstd), and a Python 3.12 or later venv with
+  `tools/requirements.txt` for the generator and the build.
+- MSYS2 with the UCRT64 toolchain: gcc (for `tools/build_zbic.py`), clang, lld and ninja, and the libraries the game
+  links (SDL3, Vulkan headers and loader, Vulkan Memory Allocator, opus, libvpx, dav1d). The tools look for it in
+  `OOT_MSYS2`, then `toolchain/msys64` in the repository, then `C:\msys64`.
+- The .NET 10 SDK and the MSVC build tools for the shader translator.
+- A Vulkan GPU; the title screen's upscaler is fastest with `VK_KHR_cooperative_matrix` (recent NVIDIA, AMD or Intel).
+- About 30 GB free for the extracted RomFS, besides the dump.
+
+Steps:
+
+1. Copy `config.example.toml` to `config.local.toml` and point `base` at your `.nup`.
+2. `python tools/build_zbic.py` builds the decoder for the Switch 2's compressed executables.
+3. `py -3.14 tools/extract_nup.py` extracts the ExeFS and RomFS to `build/extracted/v131072/` and checks every file
+   against the hash in the container. `tools/build_game.py` takes only a checked RomFS, so do not pass
+   `--no-verify`; to redo only the RomFS, add `--romfs-only`.
+4. `python recomp/gen.py --exefs build/extracted/v131072/exefs --out generated/v131072` lifts the game's code to C
+   (about a gigabyte of it).
+5. `python tools/build_xlate.py` builds the shader translator, then `python tools/build_game.py` compiles and links
+   `build/v131072/oot.exe`.
+6. Run `build\v131072\oot.exe`, or `python3 tools/run.py` from WSL, which also sets the environment and keeps the
+   window's focus (the game pauses without it).
 
 ## License
 

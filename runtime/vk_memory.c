@@ -247,7 +247,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
 }
 
 // ---------------------------------------------------------------- guest page table
-// Shaders follow pointers into any guest memory (translator patch 0021): an address no constant buffer entry traces
+// Shaders follow pointers into any guest memory (patch 0024, in xlate/wip): an address no constant buffer entry traces
 // is looked up here, on the GPU. Two levels over 40-bit guest addresses: a directory of 1024 entries (one per GiB),
 // each the device address of a block of 262144 entries (one per 4 KiB page), each the device address of the page's
 // first byte in the buffer backing it (an import's host buffer, a physical pool's buffer, or through a virtual pool's
