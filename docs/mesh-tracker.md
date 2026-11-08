@@ -185,3 +185,19 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   (`build/logs/bank0-level.png`). Not yet measured: whether the culling chain's indirect records are still zero with
   the uniform table in place (`OOT_MESH_IND_LOG=<frame>`, 329a74a, starts the readback at the level). Next: that
   readback; if they are, the readback of the chain's first kernels' storage buffers, as above.
+- 2026-11-08: the zero counts come from the translator. Run 442 (`OOT_MESH_IND_LOG=4000`): with the uniform table
+  the records are still 0 0 0 0 and {0, 1, 1}. Dump 443 (frame 4500): the chain is pass 0 (`ed1f533a`, 169x1x1),
+  then indirect dispatches in passes 1-11; pass 1 reads its record at 0x29bb40000 (alternating with 0x29bb4c000 by
+  frame, the same addresses every run), pass 5 at 0x29bb40010. No dispatch binds those buffers but the indirect
+  ones, and `OOT_GPU_WATCH` (new, `nvn_api_cmd.c gpu_watch`: every copy, clear, report and inline update into a
+  range) saw no command write them (run 444). The translator's notes in the shader cache (`<key>.res.json`) say
+  why: Ryujinx's GlobalToStorage drops a global access whose address it cannot trace to a constant-buffer entry
+  ("Failed to find storage buffer for global memory operation": loads read 0, stores and atomics do nothing). Pass
+  0 loses 5 stores, 6 AtomicAdd and 3 AtomicMaxU32 that way, and 35 loads read 0; every indirect kernel of the
+  chain has 3-19 such loads. Their buffers hold GPU addresses (pass 1's slots 2 and 3 start with 0x2a19e9000 and
+  0x29bb2d000): the kernels follow pointers they load from memory. Over the cache: 155 of 1340 compute programs
+  have dropped accesses (24 drop a store or atomic), 6 of 11 task and 11 of 88 mesh programs drop loads, some
+  vertex and fragment programs too (the counts may include entries of older translators). Next: real pointer
+  access for the accesses GlobalToStorage cannot place, instead of dropping them: VK_KHR_buffer_device_address
+  (PhysicalStorageBuffer pointers in SPIR-V) and a translation from guest GPU addresses to host device addresses
+  (each guest pool is a Vulkan buffer), e.g. a page table the shader reads. A design note before code.
