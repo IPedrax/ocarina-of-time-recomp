@@ -46,9 +46,6 @@
 // table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
 // (MIT, tools/vendor/ryujinx).
 #include <io.h>
-// OOT_FENCE_TRACE (vk_sync.c's watchdog): mark the step the replay is in, so a stall names it
-void vk_trace_stage(int s);
-int vk_trace_enabled(void);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -59,7 +59,6 @@ static void ft_init(void) {
     const char *e = cfg_get("OOT_FENCE_TRACE");
     ftrace = e && *e && *e != '0';
     if (ftrace) {
-        extern int vk_exec_trace_on;   // vk_exec.c
         vk_exec_trace_on = 1;
         rt_log("fence: trace on (OOT_FENCE_TRACE)");
     }
@@ -100,7 +99,6 @@ static DWORD WINAPI ft_watch_main(void *arg) {
             beat = 0;
             uint64_t tl = 0;
             vkGetSemaphoreCounterValue(c->device, c->timeline, &tl);
-            extern volatile LONG64 vk_exec_cur_op;   // vk_exec.c
             long long op = __atomic_load_n(&vk_exec_cur_op, __ATOMIC_RELAXED);
             rt_log("fence: hb done=%llu issued=%llu timeline=%llu stage=%lld cstage=%lld cur=%lld op=%s(%lld) waits=%lld",
                    (unsigned long long)d, (unsigned long long)i, (unsigned long long)tl,
@@ -578,9 +576,10 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     } else {
         uint64_t t0 = kern_now_ns();
         if (ftrace > 0 && value > done) {
-            InterlockedIncrement64(&ft_waits);
-            rt_log("fence: wait %llu issued=%llu done=%llu", (unsigned long long)value,
-                   (unsigned long long)issued, (unsigned long long)done);
+            // Counted always, logged for the first 64: a frame waits several times, and the count is in the heartbeat.
+            if (InterlockedIncrement64(&ft_waits) <= 64)
+                rt_log("fence: wait %llu issued=%llu done=%llu", (unsigned long long)value,
+                       (unsigned long long)issued, (unsigned long long)done);
         }
         while (done < value) {
             DWORD ms = INFINITE;

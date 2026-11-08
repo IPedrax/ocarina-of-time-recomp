@@ -358,6 +358,12 @@ void flip_rows(uint8_t *px, uint32_t w, uint32_t h);   // boot.c: reverses the r
 // Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
+// OOT_FENCE_TRACE=1 (vk_sync.c's watchdog): the step the submit path is in (vk_sync.c, op_dispatch, compute_create)
+// and the op the replay is on (vk_exec.c walk), so a stall names where it is stuck. vk_trace_stage costs a load when off.
+void vk_trace_stage(int s);
+int vk_trace_enabled(void);
+extern int vk_exec_trace_on;
+extern volatile long long vk_exec_cur_op, vk_exec_cur_fence;
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted

@@ -18,9 +18,6 @@
 // 9365-9488, 9489-9921, 10013-10079 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the uniform-buffer spans, texture and
 // sampler descriptor lookups and the dispatch flow follow LAS Recomp runtime/nvn/vulkan/exec.c:1851-1908, 2300-2516
 // @ da35b83a (MIT, Copyright (c) 2026 Peiikai). The support buffer layout is Ryujinx's SupportBuffer.cs (MIT).
-// OOT_FENCE_TRACE (vk_sync.c's watchdog): mark the step the replay is in, so a stall names it
-void vk_trace_stage(int s);
-
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -3029,7 +3026,7 @@ static int skip_cs(const GfxShader *cs) {
     return skip;
 }
 
-static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+static void op_dispatch_steps(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     {   // OOT_SKIP_DISPATCH_FROM=<n> (diagnostic): the n-th and later compute dispatches since boot are not recorded, to
@@ -3074,7 +3071,13 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     ex->recorded++;
     cr_after_dispatch(ex, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
-    vk_trace_stage(5);   // back to "recording this submission" (vk_sync_submit's own stage)
+}
+
+// OOT_FENCE_TRACE: op_dispatch_steps marks stages 20-24 and may return after any of them (a skipped or failed
+// dispatch); back to 5, vk_sync_submit's "recording this submission", whichever way it returned.
+static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+    op_dispatch_steps(ex, d);
+    vk_trace_stage(5);
 }
 
 // OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible

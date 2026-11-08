@@ -826,8 +826,8 @@ static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs;
 
 // OOT_FENCE_TRACE (vk_sync.c's watchdog): the op the replay is inside, so a stall names it.
-volatile LONG64 vk_exec_cur_op = -1;
-volatile LONG64 vk_exec_cur_fence = -1;
+volatile long long vk_exec_cur_op = -1;
+volatile long long vk_exec_cur_fence = -1;
 int vk_exec_trace_on;   // set by vk_sync.c when OOT_FENCE_TRACE is on: gates the two stores in walk()
 
 static void maybe_split(VkExec *ex) {
