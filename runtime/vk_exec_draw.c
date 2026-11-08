@@ -115,14 +115,14 @@ static struct {
     VkBuffer sup_buf;
     VkDeviceSize sup_off;
     int sup_valid;
-    uint8_t c0[3][VK_C0_BYTES];          // last c0 bank per stage (vertex, fragment, compute) and where it lives
-    VkBuffer c0_buf[3];
-    VkDeviceSize c0_off[3];
-    int c0_valid[3];
-    VkBuffer c1_buf[3];                 // the lowered constant bank 1 of the shader c1_of[k] (OoT, ubo_info)
-    VkDeviceSize c1_off[3], c1_size[3];
-    const GfxShader *c1_of[3];
-    struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[3];   // what vk_c0_fill read for c0[k]
+    uint8_t c0[5][VK_C0_BYTES];          // last c0 bank per stage (bank_k: vertex, fragment, compute, task, mesh)
+    VkBuffer c0_buf[5];                  // and where it lives
+    VkDeviceSize c0_off[5];
+    int c0_valid[5];
+    VkBuffer c1_buf[5];                 // the lowered constant bank 1 of the shader c1_of[k] (OoT, ubo_info)
+    VkDeviceSize c1_off[5], c1_size[5];
+    const GfxShader *c1_of[5];
+    struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[5];   // what vk_c0_fill read for c0[k]
     VkPipelineLayout ds_layout;          // graphics layout the sets below were last pushed or bound with
     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
@@ -947,14 +947,22 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // 16 bytes at 0x110 (vertex), 0x510 (fragment), 0x310 (compute): Ryujinx's GlobalToStorage fallback loads each
 // candidate base from here and compares the global pointer against it. Compute: dispatch size at 0x200, the uniform
 // buffer table at 0x210 + 16 r. Graphics: the largest point size (Maxwell's limit, GLSLC clamps gl_PointSize to it) at
-// 0x610, the base instance at 0x644. Other stages: zeros. Unbound slots read zero, since the replay keeps them zero.
-// Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
+// 0x610, the base instance at 0x644. NVN2's task and mesh stages: their storage tables at 0x670 and 0x770, nothing
+// else (2026-11-07, from Hookshot's gpu/vk/vk_bank.cpp driver_bank_word, read for behaviour only: the game's task
+// programs read storage slot 0 there, and with it null they find nothing to draw). Other stages: zeros. Unbound slots
+// read zero, since the replay keeps them zero. Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
+static int c0_ssbo_base(int st) {   // where c0 holds a stage's storage-buffer table; -1: none
+    return st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 : st == NVN_STAGE_CS ? 0x310
+         : st == NVN_STAGE_TS ? 0x670 : st == NVN_STAGE_MS ? 0x770 : -1;
+}
+
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     memset(bank, 0, VK_C0_BYTES);
-    int base = stage == NVN_STAGE_VS ? 0x110 : stage == NVN_STAGE_FS ? 0x510 : stage == NVN_STAGE_CS ? 0x310 : -1;
+    int base = c0_ssbo_base(stage);
     if (base < 0) return;
     c0_table(bank + base, ssbo);
+    if (stage == NVN_STAGE_TS || stage == NVN_STAGE_MS) return;
     if (stage == NVN_STAGE_CS) {
         memcpy(bank + 0x200, dispatch, 12);
         c0_table(bank + 0x210, ubo);
@@ -975,21 +983,25 @@ static int c0_on(void) {   // OOT_FIX_C0=0: c0 reads zeros instead of the driver
 
 // NVN2 (SM86) compute shaders read constant bank 0 as: 0x10 reserved bytes (the dispatch size here), the constants
 // pushed with nvnCommandBufferPushComputeConstants, then the driver's tables of the bound resources in slot order:
-// storage buffers {u64 address, u32 size, u32 0} for control[0xb2] slots, texture handles (u64) for control[0xb3]
+// uniform buffers {u64 address, u32 size, u32 0} for control[0xb1] slots, storage buffers {u64 address, u32 size, u32 0} for control[0xb2] slots, texture handles (u64) for control[0xb3]
 // slots, image handles (u64) for control[0xb6] slots (measured on the upscaler's kernels, docs/phase3.md
 // 2026-11-06: a kernel with a 0x54-byte push, 3 storage slots, 4 texture slots and 2 image slots reads its storage
 // slot 2 at 0x90, textures 0 and 3 at 0xa0 and 0xb8, image 1 at 0xc8; one with no push reads slots 0 and 1 at 0x10
-// and 0x20). The push is consumed by the next dispatch.
-static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32_t *nt, uint32_t *ni) {
+// and 0x20). The push is consumed by the next dispatch. The uniform table (2026-11-07, from Hookshot's
+// gpu/vk/vk_bank.cpp cs_layout, read for behaviour only): ace1cec0, the level's 1.5 s kernel, has six uniform slots,
+// no push and its tables at 0x10-0x98; with the uniform table left zero its loops read their bounds through null.
+static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *nu, uint32_t *ns, uint32_t *nt, uint32_t *ni) {
     const uint8_t *ctl, *code;
     uint32_t len;
     if (!ex->prog || !vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
-    *ns = ctl[0xb2], *nt = ctl[0xb3], *ni = ctl[0xb6];
+    static int ubo_table = -1;   // OOT_NVN2_UBO_TABLE=0 (diagnostic): the uniform table left out, as before 2026-11-07
+    if (ubo_table < 0) ubo_table = !(cfg_get("OOT_NVN2_UBO_TABLE") && *cfg_get("OOT_NVN2_UBO_TABLE") == '0');
+    *nu = ubo_table ? ctl[0xb1] : 0, *ns = ctl[0xb2], *nt = ctl[0xb3], *ni = ctl[0xb6];
     // The tables end at the u16 at control +0xba (2026-11-06: eb67c232 1 storage + 2 textures ends at 0x40 and reads
     // its storage slot at 0x20; 5d415995 5 storage, no push, ends at 0x60; c82d3cba ends at 0xd8): the shader's own
     // layout. The game may push more bytes than the shader declares, and a base from the pushed length then moved the
     // tables (the level's compute textures read no handle). The pushed length is the fallback.
-    uint32_t end = (uint32_t)ctl[0xba] | (uint32_t)ctl[0xbb] << 8, tables = 16 * *ns + 8 * *nt + 8 * *ni;
+    uint32_t end = (uint32_t)ctl[0xba] | (uint32_t)ctl[0xbb] << 8, tables = 16 * *nu + 16 * *ns + 8 * *nt + 8 * *ni;
     if (end >= 0x10 + tables && end <= VK_C0_BYTES) *base = end - tables;
     else *base = 0x10 + ((ex->push_cc_len + 15u) & ~15u);
     return 1;
@@ -999,9 +1011,14 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memset(bank, 0, VK_C0_BYTES);
     memcpy(bank, c0_dim, 12);
     memcpy(bank + 0x10, ex->push_cc, ex->push_cc_len);
-    uint32_t base, ns, nt, ni;
-    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
+    uint32_t base, nu, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &nu, &ns, &nt, &ni)) return;
     uint32_t o = base;
+    for (uint32_t k = 0; k < nu && k < 16 && o + 16 <= VK_C0_BYTES; k++, o += 16) {
+        uint32_t size = (uint32_t)ex->ubo[NVN_STAGE_CS][k].size;
+        memcpy(bank + o, &ex->ubo[NVN_STAGE_CS][k].addr, 8);
+        memcpy(bank + o + 8, &size, 4);
+    }
     for (uint32_t k = 0; k < ns && k < 16 && o + 16 <= VK_C0_BYTES; k++, o += 16) {
         uint32_t size = (uint32_t)ex->ssbo[NVN_STAGE_CS][k].size;
         memcpy(bank + o, &ex->ssbo[NVN_STAGE_CS][k].addr, 8);
@@ -1016,11 +1033,14 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     c0_table(bank + 0x210, ex->ubo[NVN_STAGE_CS]);
 }
 
-// The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image; -1 outside.
+// The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image, 3 uniform
+// buffer; -1 outside.
 static int nvn2_c0_slot(const VkExec *ex, uint32_t off, int *kind) {
-    uint32_t base, ns, nt, ni;
-    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni) || off < base) return -1;
+    uint32_t base, nu, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &nu, &ns, &nt, &ni) || off < base) return -1;
     off -= base;
+    if (off < 16 * nu) return *kind = 3, (int)(off / 16);
+    off -= 16 * nu;
     if (off < 16 * ns) return *kind = 0, (int)(off / 16);
     off -= 16 * ns;
     if (off < 8 * nt) return *kind = 1, (int)(off / 8);
@@ -1036,8 +1056,12 @@ static int nvn2_cs(const VkExec *ex, int st) {   // an SM86 compute program is b
 }
 
 // c0 from replay scratch; a bank equal to the stage's previous one reuses its range, so it costs no copy.
+static int bank_k(int st) {   // the per-stage bank caches' index
+    return st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : st == NVN_STAGE_TS ? 3 : st == NVN_STAGE_MS ? 4 : 2;
+}
+
 static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
-    int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
+    int k = bank_k(st);
     // vk_c0_fill reads the storage slots, and the uniform slots and dispatch size for compute or the base instance for
     // graphics: equal inputs give the same bank, so neither the fill nor the 2 KiB compare is needed.
     typeof(B.c0_in[0]) in;
@@ -1082,7 +1106,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t n = 0;
         const uint8_t *c1 = s ? gfx_shader_c1(s, &n) : NULL;
         if (c1 && n) {
-            int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
+            int k = bank_k(st);
             if (B.c1_of[k] != s || !B.c1_buf[k]) {
                 uint64_t size = (n + 255) & ~255ull;
                 uint8_t *dst = scratch(ex, size, &B.c1_buf[k], &B.c1_off[k]);
@@ -1104,14 +1128,15 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
 
 // The NVN slot of a storage binding. Ryujinx numbers a shader's storage buffers in the order it meets them
 // (GfxShaderRes.slot); the NVN slot is the entry of the driver constant buffer c0 that holds the buffer's address
-// (cbuf_slot 0, handle = word offset): 16-byte entries at byte 0x110 (vertex), 0x510 (fragment) and 0x310 (compute).
+// (cbuf_slot 0, handle = word offset): 16-byte entries at byte 0x110 (vertex), 0x510 (fragment), 0x310 (compute),
+// 0x670 (task) and 0x770 (mesh).
 // A compute address at c0 0x210..0x30f is uniform block (offset - 0x210) / 16 read as storage: *ubo is set. -1: the
 // address is not in c0 (the shader loads it from a user uniform block: ubo_ptr) or the stage has no known table.
 // Mapping: MacNativeGames games/totk/tools/totk_xlate/Service.cs:206-222 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou).
 static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     *ubo = 0;
     if (r->cbuf_slot != 0) return -1;
-    int off = r->handle * 4, base = st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 : st == NVN_STAGE_CS ? 0x310 : -1;
+    int off = r->handle * 4, base = c0_ssbo_base(st);
     if (st == NVN_STAGE_CS && off >= 0x210 && off < 0x310 && (off - 0x210) % 16 == 0) {
         *ubo = 1;
         return (off - 0x210) / 16;
@@ -1256,8 +1281,15 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
-        int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
-        if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
+        uint32_t off = (uint32_t)r->handle * 4;
+        int kind, s2 = nvn2_c0_slot(ex, off, &kind);
+        if (s2 >= 0 && (kind == 0 || kind == 3) && s2 < 16) b = kind == 3 ? &ex->ubo[st][s2] : &ex->ssbo[st][s2];
+        else if (s2 < 0 && off >= 0x10 && off + 8 <= 0x10 + ex->push_cc_len) {
+            // An address the game pushed (nvnCommandBufferPushComputeConstants) before the resource tables: the
+            // buffer from there to the end of its backing.
+            memcpy(&up.addr, ex->push_cc + (off - 0x10), 8);
+            if (up.addr) b = &up;
+        }
     }
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
@@ -1686,6 +1718,13 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
 #define MI_N 8
 static struct { VkBuffer b; VkDeviceSize o; uint64_t addr; uint64_t prog; } MI[MI_N];
 static int nmi, mi_logged, mi_on = -1;
+static uint64_t mi_from;   // OOT_MESH_IND_LOG=1 from the start, =<frame> from that frame on
+static int mi_init(void) {
+    const char *e = cfg_get("OOT_MESH_IND_LOG");
+    if (!e || !*e || *e == '0') return 0;
+    mi_from = strtoull(e, NULL, 10);
+    return 1;
+}
 static VkBuffer mi_buf;
 static VmaAllocation mi_alloc;
 static const uint32_t *mi_map;
@@ -2295,7 +2334,7 @@ static uint64_t cbuf_handle(const VkExec *ex, int st, const GfxShaderRes *r, uin
         int kind, slot;
         if (!nvn2_cs(ex, st)) return 0;
         slot = nvn2_c0_slot(ex, (uint32_t)(r->handle & 0x3fff) * 4 + (uint32_t)k * 8, &kind);
-        if (slot < 0 || kind == 0) return 0;
+        if (slot < 0 || kind == 0 || kind == 3) return 0;
         return kind == 2 ? (slot < 32 ? ex->img[st][slot] : 0) : (slot < 128 ? ex->tex[st][slot] : 0);
     }
     if (r->cbuf_slot < 3 || r->cbuf_slot - 3 >= 18) return 0;
@@ -3388,8 +3427,8 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
         VkMemSpan ip;
         if (!vk_mem_resolve(d->ind, 12, &ip) || ip.offset % 4)
             return warn_once(W_INDIRECT, "indirect mesh arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
-        if (mi_on < 0) mi_on = cfg_get("OOT_MESH_IND_LOG") && *cfg_get("OOT_MESH_IND_LOG") == '1';
-        if (mi_on && nmi < MI_N && mi_logged < 48)
+        if (mi_on < 0) mi_on = mi_init();
+        if (mi_on && nmi < MI_N && mi_logged < 48 && gfx_counters.frames >= mi_from)
             MI[nmi].b = ip.buffer, MI[nmi].o = ip.offset, MI[nmi].addr = d->ind, MI[nmi].prog = ex->prog->serial, nmi++;
         rec_mesh_tasks_ind(draw_ind_fn, ex->cb, ip.buffer, ip.offset, 1, 12);
         vk_mem_count(ip.cls, VK_MUSE_IND, 12);
@@ -3425,8 +3464,8 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         return;
     }
     if (skip_cs(cs)) return;
-    if (mi_on < 0) mi_on = cfg_get("OOT_MESH_IND_LOG") && *cfg_get("OOT_MESH_IND_LOG") == '1';
-    if (mi_on && nmi < MI_N && mi_logged < 48)   // OOT_MESH_IND_LOG: dispatch arguments too (program serial tagged odd)
+    if (mi_on < 0) mi_on = mi_init();
+    if (mi_on && nmi < MI_N && mi_logged < 48 && gfx_counters.frames >= mi_from)   // OOT_MESH_IND_LOG: dispatch arguments too (program serial tagged odd)
         MI[nmi].b = ip.buffer, MI[nmi].o = ip.offset, MI[nmi].addr = d->ind, MI[nmi].prog = ex->prog->serial | 1ull << 63, nmi++;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
