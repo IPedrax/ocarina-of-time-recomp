@@ -1397,10 +1397,10 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     build_key(r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
     if (sm86_probe_match(code, r->length)) {   // OOT_PROBE: the probed lowering under a key of its own, same input id
         const char *spec = sm86_probe_spec();
-        uint8_t buf[32 + 64];
-        size_t n = strlen(spec) < 64 ? strlen(spec) : 64;
-        memcpy(buf, r->key, 32), memcpy(buf + 32, spec, n);
-        rt_sha256(buf, 32 + n, r->key);
+        uint8_t buf[32 + 32];   // the key with a hash of the whole spec (a reach list runs long)
+        memcpy(buf, r->key, 32);
+        rt_sha256((const uint8_t *)spec, strlen(spec), buf + 32);
+        rt_sha256(buf, sizeof buf, r->key);
         static volatile LONG logged;
         if (InterlockedIncrement(&logged) <= 4) rt_log("gfx_shader: OOT_PROBE %s: program found (%u bytes)", spec, r->length);
     }

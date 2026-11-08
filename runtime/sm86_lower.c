@@ -64,7 +64,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 
 #define NSCRATCH 12
 #define PROBE_REG 254                                 // OOT_PROBE's capture register (sm86_probe_match)
-static struct { int parsed, on, as_int, n, buf_slot; char hash[17]; uint32_t offset[3], reg[3]; } probe_spec = {.buf_slot = -1};   // probe_parse
+static struct { int parsed, on, as_int, n, buf_slot, nreach; char hash[17]; uint32_t offset[3], reg[3], reach[32]; } probe_spec = {.buf_slot = -1};   // probe_parse
 #define RZ 255u
 #define PT 7u
 #define NOREG 0xffffffffu
@@ -85,6 +85,7 @@ typedef struct {
     uint32_t ur_next, scratch_base;                // the pool above max_gpr: uniform registers from ur_next up
     int probe, nprobe; uint32_t probe_index[3], probe_reg[3];   // OOT_PROBE (sm86_probe_match): the instruction and register captured
     int probe_lx_log2;                                           // OOT_PROBE buffer mode: log2 of the workgroup width
+    uint32_t reach_index[32];                                    // OOT_PROBE_REACH: the instructions whose bit is set
                                                    // to scratch_base, scratch registers from there (allocated
                                                    // on first use, ascending so pairs and runs stay adjacent)
     int nscratch;
@@ -3137,6 +3138,24 @@ static void probe_parse(void) {
     const char *e = getenv("OOT_PROBE");
     unsigned off, reg;
     char h[17];
+    // OOT_PROBE_REACH=<code hash>:b<slot>:<offset>[,<offset>...] (at most 32): R254 starts as 0 and gets bit k set right
+    // after the instruction at <offset k> (unconditionally: every thread that passes there), and buffer mode stores it
+    // at EXIT. One run gives the share of threads reaching each point: where most of them leave a kernel.
+    const char *re = getenv("OOT_PROBE_REACH");
+    unsigned slot;
+    int used;
+    if (re && sscanf(re, "%16[0-9a-fA-F]:b%u:%n", h, &slot, &used) == 2 && slot < 16) {
+        snprintf(probe_spec.hash, sizeof probe_spec.hash, "%s", h);
+        probe_spec.on = 1, probe_spec.n = 0, probe_spec.buf_slot = (int)slot;
+        for (const char *p = re + used; *p && probe_spec.nreach < 32;) {
+            char *q;
+            unsigned long o = strtoul(p, &q, 16);
+            if (q == p) break;
+            probe_spec.reach[probe_spec.nreach++] = (uint32_t)o;
+            p = *q == ',' ? q + 1 : q;
+        }
+        return;
+    }
     if (e && sscanf(e, "%16[0-9a-fA-F]:%x:%u", h, &off, &reg) == 3 && reg < 255) {
         snprintf(probe_spec.hash, sizeof probe_spec.hash, "%s", h);
         probe_spec.offset[0] = off, probe_spec.reg[0] = reg, probe_spec.on = 1, probe_spec.n = 1;
@@ -3167,7 +3186,10 @@ int sm86_probe_match(const uint8_t *code, uint32_t len) {
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
     return !strncmp(hex, probe_spec.hash, strlen(probe_spec.hash));
 }
-const char *sm86_probe_spec(void) { return getenv("OOT_PROBE"); }
+const char *sm86_probe_spec(void) {   // the spec the probed program is keyed by: OOT_PROBE_REACH first, as probe_parse
+    const char *r = getenv("OOT_PROBE_REACH");
+    return r && *r ? r : getenv("OOT_PROBE");
+}
 
 int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out) {
     return sm86_lower_ex(code, code_size, control, control_size, out, sm86_lower_tensor_cores);
@@ -3204,9 +3226,13 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
     }
     if (sm86_probe_match(code, code_size)) {
-        if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG + 1 - (uint32_t)probe_spec.n)
+        if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG + 1 - (uint32_t)(probe_spec.n ? probe_spec.n : 1))
             fail(&l, "OOT_PROBE: no register free for the capture");
         l.probe = 1, l.nprobe = probe_spec.n;
+        if (probe_spec.nreach) {   // OOT_PROBE_REACH: R254 = 0, its bits set as the points are passed
+            emit(&l, MOV32I | ((uint64_t)7 << 16) | PROBE_REG | ((uint64_t)0xf << 12));
+            for (int k = 0; k < probe_spec.nreach; k++) l.reach_index[k] = (probe_spec.reach[k] - header) / 16;
+        }
         for (int k = 0; k < l.nprobe; k++) {
             l.probe_index[k] = (probe_spec.offset[k] - header) / 16, l.probe_reg[k] = probe_spec.reg[k];
             uint64_t init = probe_spec.buf_slot >= 0 ? 0xfeedfaceull : 0;   // buffer mode: a sentinel for "never reached"
@@ -3224,6 +3250,10 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
         lower_one(&l, &l.in[l.index]);
+        for (int k = 0; l.probe && k < probe_spec.nreach; k++)   // OOT_PROBE_REACH: bit k, unconditionally
+            if (l.index == l.reach_index[k])
+                emit(&l, LOP32I | ((uint64_t)7 << 16) | PROBE_REG | ((uint64_t)PROBE_REG << 8) | ((uint64_t)(1u << k) << 20) |
+                             ((uint64_t)1 << 53));
         for (int k = 0; l.probe && k < l.nprobe; k++) {
             uint32_t cap = PROBE_REG - (uint32_t)k;
             if (l.index != l.probe_index[k]) continue;
