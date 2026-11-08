@@ -238,6 +238,9 @@ class Emitter:
         self.reg_locals = reg_locals   # recomp/regs.py: registers per function in C locals
         self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
         self.uses_patches = False
+        # Calls to the setjmp PLT stub: the generated function takes a host setjmp of its own around the call, so
+        # that the guest longjmp (runtime/sjlj.c) can come back into this frame (docs/level.md: Lua's errors).
+        self.setjmp_stubs = {a for a, sym in mod.plt_stubs().items() if sym in ('setjmp', '_setjmp')}
         self.stats = Counter()
         self.unsupported = Counter()
 
@@ -397,6 +400,15 @@ class Emitter:
                 out.append('    ' + fp.decl())
 
         def call(t, a):
+            if t in self.setjmp_stubs:
+                # RT_SETJMP (cpu.h, runtime/sjlj.c): the host setjmp in this frame, keyed by the guest jmp_buf in x0.
+                # The second return, from the guest longjmp, finds the Cpu as longjmp restored it: every local
+                # register is reloaded from it, the callee-saved ones too (RELOAD, not RELOAD_CALL).
+                self.stats['setjmp_sites'] += 1
+                target = f'{fname(t)}(c);' if t in starts else f'c->pc = {hx(t)}; rt_dispatch(c);'
+                if t in starts:
+                    refs.add(t)
+                return f'c->x[30] = {hx(a + 4)}; {spill}if (!RT_SETJMP(c)) {{ {target} }}{reload}'
             if t in starts:
                 refs.add(t)
                 return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
