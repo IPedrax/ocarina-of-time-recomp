@@ -5,7 +5,7 @@
 // VK_EXT_external_memory_host). Between presents frame-1 and frame, the replay's command buffers also copy, after each
 // render pass, its colour and depth targets and, after each dispatch, the storage images it writes into host buffers;
 // the completion thread turns them into 8-bit PNGs once the submission is done. 3D textures (LUTs, volumes) sampled or
-// written in the frame are copied once each, slices side by side. Files in OOT_DUMP_DIR (default "dump"):
+// written in the frame are copied once each, slices side by side. Files in OOT_DUMP_DIR (default: "dump" next to oot.exe):
 //   pass_<seq>_t<i>_<w>x<h>_<vkformat>_<name>.png   colour target i (td: depth; img<slot>: storage image; lut<id>: 3D;
 //                                                    a BC target drawn through a block view: its blocks as that view)
 //   ..._tm.png                                       float formats: x/(1+x) of the same image (the plain one clamps)
@@ -595,6 +595,15 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                 if (ex->ssbo[st][k].addr)
                     sp(b, " %d=%#llx+%#llx", k, (unsigned long long)ex->ssbo[st][k].addr, (unsigned long long)ex->ssbo[st][k].size);
             sp(b, "\n");
+            // The first words of each slot as the CPU sees them (the submission's snapshot, else guest memory): a
+            // CPU-written buffer's contents, e.g. a record count a kernel loops to.
+            for (int k = 0; k < 4; k++) {
+                uint64_t a = ex->ssbo[st][k].addr;
+                const uint32_t *w = a ? vk_usnap_peek(a, 16) : NULL;
+                VkMemSpan msp;
+                if (!w && a && vk_mem_resolve(a, 16, &msp)) w = (const uint32_t *)(uintptr_t)a;
+                if (w) sp(b, "      slot %d words: %08x %08x %08x %08x\n", k, w[0], w[1], w[2], w[3]);
+            }
             continue;
         }
         if (r && bd->kind == GFX_RES_UBO && dump_ubo && r->slot == 1 && ex->prog) {   // the compiler's constant bank
@@ -1193,8 +1202,18 @@ void vk_dump_init(void) {
         w[0] = (uint32_t)strtoul(q, &q, 10);
         w[1] = *q == 'x' ? (uint32_t)strtoul(q + 1, &q, 10) : 0;
     }
+    // Default: "dump" next to oot.exe (under build/, which git ignores). It was "dump" in the working directory, the
+    // repository's root when run.py starts the game: a dump armed with --env OOT_DUMP=... (no OOT_DUMP_DIR) wrote the
+    // game's images into the tree (2026-11-07).
     const char *d = cfg_get("OOT_DUMP_DIR");
-    snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
+    if (d && *d) snprintf(dir, sizeof dir, "%s", d);
+    else {
+        char exe[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
+        char *slash = n ? strrchr(exe, '\\') : NULL;
+        if (slash) *slash = 0, snprintf(dir, sizeof dir, "%s\\dump", exe);
+        else snprintf(dir, sizeof dir, "dump");
+    }
     make_dirs(dir);
     char path[600];
     snprintf(path, sizeof path, "%s/passes.txt", dir);
