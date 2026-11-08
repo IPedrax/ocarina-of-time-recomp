@@ -105,11 +105,26 @@ static void counter_cb(void *arg) {
     free(addr);
 }
 
-// Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
-// and a samples-passed one as unknown.
-#define PENDING 256
+// The last report the replay queued to each address, with its fence: while the GPU has not finished it, the condition
+// of RENDER_COND reads a timestamp one as 0 and a samples-passed one as unknown (rendering). A table by address, not a
+// ring of the last 256 reports: OoT makes over 300 samples-passed reports a frame (one per tested object), the ring
+// dropped the oldest before their conditions were read, those conditions then read the word in memory (an older
+// count, often 0) and skipped the object, and whole objects (the Deku Tree's trunk, roots, branches) blinked out
+// frame after frame (2026-11-08, OOT_COND_LOG: "0 (1) vs 0 (1) -> skip" for an object reported in the same frame).
+// Replay thread only.
+#define PENDING 65536
 static struct { uint64_t addr, fence; int unknown; } pending[PENDING];
-static unsigned pending_head;
+static uint32_t pending_slot(uint64_t a) { return (uint32_t)((a >> 3) * 0x9e3779b97f4a7c15ull >> 48) & (PENDING - 1); }
+static void pending_set(uint64_t addr, uint64_t fence, int unknown) {
+    uint32_t i = pending_slot(addr), k = 0;
+    while (pending[i].addr && pending[i].addr != addr && ++k < PENDING) i = (i + 1) & (PENDING - 1);
+    if (k == PENDING) {
+        static int said;
+        if (!said) said = 1, rt_log("vk: report table full: conditions on new report addresses read memory");
+        return;
+    }
+    pending[i].addr = addr, pending[i].fence = fence, pending[i].unknown = unknown;
+}
 
 // ---- occlusion counts (samples passed)
 //
@@ -288,36 +303,11 @@ static int cond_log_on(void) {
     return InterlockedIncrement(&n) <= 400;
 }
 
-// Addresses that received a samples-passed report (open addressing; 0 is empty). A conditional render on such a
-// counter renders (cond_enabled): see there.
-#define OQ_ADDRS 65536
-static uint64_t oq_addrs[OQ_ADDRS];
-static SRWLOCK oq_addrs_lock = SRWLOCK_INIT;
-static uint32_t oq_addr_slot(uint64_t a) { return (uint32_t)((a >> 4) * 0x9e3779b97f4a7c15ull >> 48) & (OQ_ADDRS - 1); }
-static void oq_addr_add(uint64_t a) {
-    static int full;
-    AcquireSRWLockExclusive(&oq_addrs_lock);
-    uint32_t i = oq_addr_slot(a), k = 0;
-    while (oq_addrs[i] && oq_addrs[i] != a && ++k < OQ_ADDRS) i = (i + 1) & (OQ_ADDRS - 1);
-    if (k < OQ_ADDRS) oq_addrs[i] = a;
-    else if (!full) full = 1, rt_log("vk: occlusion report address set full");
-    ReleaseSRWLockExclusive(&oq_addrs_lock);
-}
-static int oq_addr_has(uint64_t a) {
-    AcquireSRWLockShared(&oq_addrs_lock);
-    uint32_t i = oq_addr_slot(a), k = 0;
-    while (oq_addrs[i] && oq_addrs[i] != a && ++k < OQ_ADDRS) i = (i + 1) & (OQ_ADDRS - 1);
-    int has = k < OQ_ADDRS && oq_addrs[i] == a;
-    ReleaseSRWLockShared(&oq_addrs_lock);
-    return has;
-}
-
 static void report_counter(VkExec *ex, const p_report_counter *p) {
     int samples = p->type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_ready();
     if (cond_log_on())
         rt_log("cond: frame %llu report type %u at %#llx (fence %llu)", (unsigned long long)gfx_counters.frames, p->type,
                (unsigned long long)p->addr, (unsigned long long)ex->fence);
-    if (p->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) oq_addr_add(p->addr);
     if (nvn_gpu_only(p->addr)) {   // CPU-invisible pool: no host memory behind it
         if (samples) oq_report(ex, 0);
         return;
@@ -333,7 +323,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         *a = p->addr;
         vk_completion_add(ex->fence, counter_cb, a);
     }
-    pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};
+    pending_set(p->addr, ex->fence, samples);
 }
 
 // ---- conditional rendering
@@ -341,10 +331,9 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
 // 1: *v read, 0: not readable, 2: a samples-passed report not done yet (unknown)
 static int counter_word(uint64_t addr, uint64_t *v) {
     uint64_t done = vk_sync_fence_done();
-    for (unsigned k = 1; k <= PENDING; k++) {   // newest first: the last report to addr decides
-        unsigned i = (pending_head - k) % PENDING;
-        if (pending[i].addr == addr && pending[i].fence > done) return *v = 0, pending[i].unknown ? 2 : 1;
-    }
+    uint32_t i = pending_slot(addr), k = 0;   // the last report to addr decides
+    while (pending[i].addr && pending[i].addr != addr && ++k < PENDING) i = (i + 1) & (PENDING - 1);
+    if (k < PENDING && pending[i].addr == addr && pending[i].fence > done) return *v = 0, pending[i].unknown ? 2 : 1;
     VkMemSpan m;
     if (nvn_gpu_only(addr) || !vk_mem_resolve(addr, sizeof *v, &m)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);
@@ -360,22 +349,6 @@ static int cond_enabled(const p_render_cond *c) {
         if (always) rt_log("vk: OOT_COND_RENDER=1: conditional rendering always renders");
     }
     if (always) return 1;
-    // Occlusion culling: OoT reports samples passed per object and draws it next frame only when that counter differs
-    // from the word 16 bytes on (mode 1). The console's GPU compares in GPU order; here the condition is read on the CPU
-    // when the op is recorded, and the count reaches guest memory from the completion thread, racing the game's
-    // resets of the same words: the read gave the count one frame and 0 the next, and whole objects (the Deku Tree's
-    // trunk, roots, branches) blinked out every few frames (2026-11-08, OOT_COND_LOG: "0 (1) vs 0 (1) -> skip" next to
-    // "0 (2) vs 0 (1) -> render" for the same objects). A condition on a samples-passed counter now always renders:
-    // the depth test still hides what is occluded, so the picture is the same, at the cost of the draws the culling
-    // saved. Other conditions (values and timestamps the game writes) are read as before. OOT_OQ_COND=1 restores the
-    // reads.
-    static int oq_cond = -1;
-    if (oq_cond < 0) oq_cond = cfg_get("OOT_OQ_COND") && *cfg_get("OOT_OQ_COND") == '1';
-    if (!oq_cond && (oq_addr_has(c->addr) || oq_addr_has(c->addr + 16))) {
-        static volatile LONG said;
-        if (!InterlockedExchange(&said, 1)) rt_log("vk: conditional renders on occlusion counts render (OOT_OQ_COND=1 reads them)");
-        return 1;
-    }
     uint64_t x, y;
     int rx = counter_word(c->addr, &x), ry = counter_word(c->addr + 16, &y);
     if (!rx || !ry) {
