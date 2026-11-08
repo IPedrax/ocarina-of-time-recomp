@@ -767,11 +767,14 @@ static void portable_paths(RtConfig *c) {
     c->profile = portable_path(exe, "OOT_PROFILE_DIR", "profile", ".", pp_profile, sizeof pp_profile, c->profile);
 }
 
+void watch_start(void);   // watch.c
+
 int main(int argc, char **argv) {
     mem_init();   // first: claim the guest address space before anything else can land there; reads oot.ini
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     AddVectoredExceptionHandler(0, crash_handler);
+    watch_start();   // OOT_WATCH_WRITE (watch.c), diagnostic
     parse_trace();
     prof_start();
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
