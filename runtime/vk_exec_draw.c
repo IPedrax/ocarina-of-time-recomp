@@ -1892,7 +1892,14 @@ static void pool_sync(VkExec *ex, PoolSet *p, uint32_t mask) {
     }
     uint32_t imgs = p->filled & ~(1u << GFX_POOL_SAMPLER);
     int first_new = p->nwanted;
-    if (read_fb) {   // ids the GPU sampled, as of the last completed copy, join the wanted list
+    static int resolve = -1;   // OOT_POOL_RESOLVE=0 (diagnostic): no id is ever resolved, every pool element keeps
+                               // the stand-in of its view type (what pool samples read before d84bf5d)
+    if (resolve < 0) {
+        const char *e = cfg_get("OOT_POOL_RESOLVE");
+        resolve = !(e && *e == '0');
+        if (!resolve) rt_log("vk_exec: OOT_POOL_RESOLVE=0: pool-indexed textures keep their stand-ins");
+    }
+    if (read_fb && resolve) {   // ids the GPU sampled, as of the last completed copy, join the wanted list
         p->fb_read_ms = t0;
         PST.fb_reads++;
         vmaInvalidateAllocation(vk_ctx()->vma, p->rb_alloc, 0, VK_WHOLE_SIZE);
@@ -3302,7 +3309,7 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
 // Mesh tasks (docs/mesh.md, docs/mesh-tracker.md D3): the bound program's task (optional), mesh and fragment shaders
-// as one mesh pipeline (vk_pipeline_mesh, built on this thread, shaders awaited), then the draw path's pass, state and
+// as one mesh pipeline (vk_pipeline_mesh, built in the background, shaders awaited), then the draw path's pass, state and
 // resources, and vkCmdDrawMeshTasks(Indirect)EXT through the recorder. The indirect record is taken as Vulkan's
 // {x, y, z} group counts at its address (its 16-byte stride is the game's; a frame dump note shows its words as the
 // CPU sees them). Counted, logged at powers of two from 256; OOT_MESH=0 skips them all (diagnostic).
@@ -3364,7 +3371,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     s.xfb = 0;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_mesh(&s, ts, ms, &info);
-    if (!p || !info) return warn_once(W_PIPELINE, "a mesh pipeline could not be created: mesh draws with it are skipped");
+    if (!p || !info) return;   // building in the background (vk_pipeline_mesh), or failed (logged there)
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         vk_pipeline_set_dynamic(ex->cb, &s);

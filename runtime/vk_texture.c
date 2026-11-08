@@ -664,7 +664,14 @@ static void tex_raw_dump(const nvn_texdesc *d, const uint8_t *blocks, size_t siz
 // unmapped or not mapped yet (OoT, 2026-11-06: ids nothing samples, over physical memory at 0x5864xxxxx), harmless on
 // the console while no shader reads them. Pool-indexed sampling (vk_exec_draw.c pool sets) resolves every id, so
 // their upload reads that memory, which faulted in tex_bl_copy.
+// An imported pool that backs the whole range is guest memory the CPU maps, so readable, and asking vk_mem_resolve is
+// cheap; VirtualQuery is not: on the level's large committed regions it walks page tables for milliseconds per call
+// (as vk_exec_draw.c ptr_readable found), and asked for every texture upload it froze the level's first frame for
+// about 7 s (2026-11-08, worst frame "texture upload 6955 ms", against 168 ms before it). It stays the fallback for
+// storage no pool claims, such as that of a finalized pool.
 static int storage_readable(const void *p, size_t n) {
+    VkMemSpan sp;
+    if (vk_mem_resolve((uint64_t)(uintptr_t)p, n, &sp) && sp.pool) return 1;
     const uint8_t *a = p, *end = a + n;
     while (a < end) {
         MEMORY_BASIC_INFORMATION mi;
