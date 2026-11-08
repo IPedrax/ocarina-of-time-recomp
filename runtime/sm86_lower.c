@@ -1378,11 +1378,13 @@ static void lower_shf(L *l, const Insn *x, uint32_t op) {
         return;
     }
     // True funnel shifts: Maxwell SHF.L Rd = high word of (high:low << s) when .HI, SHF.R Rd = low word of
-    // (high:low >> s). MaxShift 37-38: 0 U64 (clamp 64), 2 U32 (clamp 32); M (50) wraps.
+    // (high:low >> s). MaxShift 37-38 as Ryujinx's InstDecoders.cs MaxShift reads it: 0 a 32-bit shift (clamp 32),
+    // 2 U64 (clamp 64); M (50) wraps. The two were the other way round until 2026-11-08 (found comparing with
+    // Fritchii's lowering): a U64 funnel by 32-63 gave 0 instead of the high word's bits.
     if (!hi_res && !right) return (void)fail(l, "SHF.L low result");
     if (hi_res && right) return (void)fail(l, "SHF.R high result");
     if (type == 0 || type == 2) return (void)fail(l, "signed funnel shift");
-    uint64_t max = (uint64_t)(type == 3 ? 2 : 0) << 37;
+    uint64_t max = (uint64_t)(type == 1 ? 2 : 0) << 37;   // U64 (type 1) 2, U32 (type 3) 0
     if (imm) {
         if (amount > 63) return (void)fail(l, "SHF immediate");
         emit(l, base(l, right ? 0x38f8000000000000ull : 0x36f8000000000000ull, rd, low) | ((uint64_t)amount << 20) |
