@@ -929,21 +929,25 @@ static int c0_on(void) {   // OOT_FIX_C0=0: c0 reads zeros instead of the driver
 
 // NVN2 (SM86) compute shaders read constant bank 0 as: 0x10 reserved bytes (the dispatch size here), the constants
 // pushed with nvnCommandBufferPushComputeConstants, then the driver's tables of the bound resources in slot order:
-// storage buffers {u64 address, u32 size, u32 0} for control[0xb2] slots, texture handles (u64) for control[0xb3]
+// uniform buffers {u64 address, u32 size, u32 0} for control[0xb1] slots, storage buffers {u64 address, u32 size, u32 0} for control[0xb2] slots, texture handles (u64) for control[0xb3]
 // slots, image handles (u64) for control[0xb6] slots (measured on the upscaler's kernels, docs/phase3.md
 // 2026-11-06: a kernel with a 0x54-byte push, 3 storage slots, 4 texture slots and 2 image slots reads its storage
 // slot 2 at 0x90, textures 0 and 3 at 0xa0 and 0xb8, image 1 at 0xc8; one with no push reads slots 0 and 1 at 0x10
-// and 0x20). The push is consumed by the next dispatch.
-static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32_t *nt, uint32_t *ni) {
+// and 0x20). The push is consumed by the next dispatch. The uniform table (2026-11-07, from Hookshot's
+// gpu/vk/vk_bank.cpp cs_layout, read for behaviour only): ace1cec0, the level's 1.5 s kernel, has six uniform slots,
+// no push and its tables at 0x10-0x98; with the uniform table left zero its loops read their bounds through null.
+static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *nu, uint32_t *ns, uint32_t *nt, uint32_t *ni) {
     const uint8_t *ctl, *code;
     uint32_t len;
     if (!ex->prog || !vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
-    *ns = ctl[0xb2], *nt = ctl[0xb3], *ni = ctl[0xb6];
+    static int ubo_table = -1;   // OOT_NVN2_UBO_TABLE=0 (diagnostic): the uniform table left out, as before 2026-11-07
+    if (ubo_table < 0) ubo_table = !(cfg_get("OOT_NVN2_UBO_TABLE") && *cfg_get("OOT_NVN2_UBO_TABLE") == '0');
+    *nu = ubo_table ? ctl[0xb1] : 0, *ns = ctl[0xb2], *nt = ctl[0xb3], *ni = ctl[0xb6];
     // The tables end at the u16 at control +0xba (2026-11-06: eb67c232 1 storage + 2 textures ends at 0x40 and reads
     // its storage slot at 0x20; 5d415995 5 storage, no push, ends at 0x60; c82d3cba ends at 0xd8): the shader's own
     // layout. The game may push more bytes than the shader declares, and a base from the pushed length then moved the
     // tables (the level's compute textures read no handle). The pushed length is the fallback.
-    uint32_t end = (uint32_t)ctl[0xba] | (uint32_t)ctl[0xbb] << 8, tables = 16 * *ns + 8 * *nt + 8 * *ni;
+    uint32_t end = (uint32_t)ctl[0xba] | (uint32_t)ctl[0xbb] << 8, tables = 16 * *nu + 16 * *ns + 8 * *nt + 8 * *ni;
     if (end >= 0x10 + tables && end <= VK_C0_BYTES) *base = end - tables;
     else *base = 0x10 + ((ex->push_cc_len + 15u) & ~15u);
     return 1;
@@ -953,9 +957,14 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memset(bank, 0, VK_C0_BYTES);
     memcpy(bank, c0_dim, 12);
     memcpy(bank + 0x10, ex->push_cc, ex->push_cc_len);
-    uint32_t base, ns, nt, ni;
-    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
+    uint32_t base, nu, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &nu, &ns, &nt, &ni)) return;
     uint32_t o = base;
+    for (uint32_t k = 0; k < nu && k < 16 && o + 16 <= VK_C0_BYTES; k++, o += 16) {
+        uint32_t size = (uint32_t)ex->ubo[NVN_STAGE_CS][k].size;
+        memcpy(bank + o, &ex->ubo[NVN_STAGE_CS][k].addr, 8);
+        memcpy(bank + o + 8, &size, 4);
+    }
     for (uint32_t k = 0; k < ns && k < 16 && o + 16 <= VK_C0_BYTES; k++, o += 16) {
         uint32_t size = (uint32_t)ex->ssbo[NVN_STAGE_CS][k].size;
         memcpy(bank + o, &ex->ssbo[NVN_STAGE_CS][k].addr, 8);
@@ -970,11 +979,14 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     c0_table(bank + 0x210, ex->ubo[NVN_STAGE_CS]);
 }
 
-// The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image; -1 outside.
+// The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image, 3 uniform
+// buffer; -1 outside.
 static int nvn2_c0_slot(const VkExec *ex, uint32_t off, int *kind) {
-    uint32_t base, ns, nt, ni;
-    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni) || off < base) return -1;
+    uint32_t base, nu, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &nu, &ns, &nt, &ni) || off < base) return -1;
     off -= base;
+    if (off < 16 * nu) return *kind = 3, (int)(off / 16);
+    off -= 16 * nu;
     if (off < 16 * ns) return *kind = 0, (int)(off / 16);
     off -= 16 * ns;
     if (off < 8 * nt) return *kind = 1, (int)(off / 8);
@@ -1209,8 +1221,15 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
-        int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
-        if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
+        uint32_t off = (uint32_t)r->handle * 4;
+        int kind, s2 = nvn2_c0_slot(ex, off, &kind);
+        if (s2 >= 0 && (kind == 0 || kind == 3) && s2 < 16) b = kind == 3 ? &ex->ubo[st][s2] : &ex->ssbo[st][s2];
+        else if (s2 < 0 && off >= 0x10 && off + 8 <= 0x10 + ex->push_cc_len) {
+            // An address the game pushed (nvnCommandBufferPushComputeConstants) before the resource tables: the
+            // buffer from there to the end of its backing.
+            memcpy(&up.addr, ex->push_cc + (off - 0x10), 8);
+            if (up.addr) b = &up;
+        }
     }
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
@@ -2239,7 +2258,7 @@ static uint64_t cbuf_handle(const VkExec *ex, int st, const GfxShaderRes *r, uin
         int kind, slot;
         if (!nvn2_cs(ex, st)) return 0;
         slot = nvn2_c0_slot(ex, (uint32_t)(r->handle & 0x3fff) * 4 + (uint32_t)k * 8, &kind);
-        if (slot < 0 || kind == 0) return 0;
+        if (slot < 0 || kind == 0 || kind == 3) return 0;
         return kind == 2 ? (slot < 32 ? ex->img[st][slot] : 0) : (slot < 128 ? ex->tex[st][slot] : 0);
     }
     if (r->cbuf_slot < 3 || r->cbuf_slot - 3 >= 18) return 0;
