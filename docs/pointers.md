@@ -124,4 +124,9 @@ matters; to be measured with `OOT_MEMORY=verify`.
 
 ## Status
 
-- 2026-11-08: written; nothing implemented.
+- 2026-11-08: written.
+- 2026-11-08: P1 done (`vk_memory.c`, "pointer table"; `vk_mem_ptr_table` hands it to the replay). On the level
+  route at frame 4000 (`OOT_GPU_POINTERS_CHECK=4000`): 3,950 pools, 1,337,961 pages (1,259,881 backed), every entry
+  equal to `vk_mem_resolve`'s buffer and offset; 10 of the 16 default blocks in use. The pool buffers now carry
+  `SHADER_DEVICE_ADDRESS` (imports allocate with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`): 0 validation errors,
+  frame rate unchanged. Entries name the imported buffer even when the pool has a VRAM mirror (P5). Next: P2.

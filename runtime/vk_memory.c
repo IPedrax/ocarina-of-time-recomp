@@ -55,6 +55,7 @@ typedef struct PoolRec {
     uint64_t lo, size;                 // GPU address range of the pool
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
     VkBuffer buf;
+    VkDeviceAddress bda;               // buf's device address (pointer table on, docs/pointers.md), else 0
     VkDeviceMemory mem;                // POOL_IMPORT
     VmaAllocation alloc;               // POOL_PHYS
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
@@ -94,16 +95,19 @@ static int nphys, cap_phys;
 static long n_imports, n_import_failures;
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
+static int ptr_table_on(void);                 // "pointer table" below
+static VkDeviceAddress buffer_address(VkBuffer b);
+
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
     VkBufferUsageFlags u = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                            VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-    if (c->has_buffer_device_address) u |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;   // the guest page table
     if (c->has_transform_feedback)
         u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     if (c->has_conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+    if (ptr_table_on()) u |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     return u;
 }
 
@@ -113,6 +117,237 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
     for (uint32_t i = 0; i < c->mem_props.memoryTypeCount; i++)
         if (bits >> i & 1) return (int)i;
     return -1;
+}
+
+// ---------------------------------------------------------------- pointer table (docs/pointers.md)
+// Shaders that follow a GPU address they loaded from memory (the accesses GlobalToStorage cannot place) look the
+// address up here: one device-local storage buffer of u64, T[0..511] the top level (one entry per GiB of the 39-bit
+// GPU address space: the index in T of that GiB's block, 0 none), then blocks of 262144 entries (4 KiB pages: the
+// Vulkan device address of the page's first byte, 0 unbacked). The address of byte a is
+// T[T[a >> 30] + ((a >> 12) & 0x3ffff)] + (a & 0xfff). 4 KiB pages because imported pools are aligned to 4 KiB
+// (import_pool); a virtual pool's 64 KiB page fills 16 entries. Each page names the buffer vk_mem_resolve gives for it
+// (an imported pool's own buffer, not its VRAM mirror: docs/pointers.md P5).
+// The host keeps a shadow of the whole buffer, changed under pool_lock exclusive (pool init, fini, MapVirtual), and
+// copies its dirty 64 KiB chunks into the device buffer through the upload batch after the change (ptr_flush), which
+// queue order puts before the submissions that follow. OOT_GPU_POINTERS=0 turns it off (no table, no device address
+// usage on the pool buffers); it is also off without bufferDeviceAddress. OOT_GPU_POINTER_BLOCKS sets the capacity
+// in blocks of 2 MiB (default 16, 16 GiB of GPU addresses); a page past it stays 0, counted and logged once.
+// OOT_GPU_POINTERS_CHECK=<frame>: at that frame (vk_mem_census) every pool page is checked against vk_mem_resolve.
+#define PT_TOP 512u
+#define PT_BLOCK 262144u
+#define PT_CHUNK 8192u                         // u64 entries per dirty chunk (64 KiB)
+static struct {
+    int on;                                    // -1 undecided
+    uint32_t cap, nblocks;                     // blocks of PT_BLOCK entries
+    uint64_t n;                                // entries in the buffer: PT_TOP + cap * PT_BLOCK
+    uint64_t *shadow;
+    uint8_t *dirty;                            // per PT_CHUNK entries
+    int any_dirty;
+    uint64_t overflow, beyond;                 // pages refused: no block left / address past 39 bits
+    VkBuffer buf;
+    VmaAllocation alloc;
+    VkDeviceAddress addr;                      // buf's device address (the support buffer hands it to shaders)
+    uint64_t check_frame;
+} PT = {.on = -1};
+static CRITICAL_SECTION pt_flush_lock;         // ptr_flush: one copy at a time, in the order of the changes
+
+static int ptr_table_on(void) {
+    if (PT.on >= 0) return PT.on;
+    VkCtx *c = vk_ctx();
+    const char *e = cfg_get("OOT_GPU_POINTERS");
+    int want = !(e && *e == '0');
+    if (!c || !want || !c->has_buffer_device_address) {
+        PT.on = 0;
+        rt_log("vk: pointer table off (%s)", !want ? "OOT_GPU_POINTERS=0" : "no bufferDeviceAddress");
+        return 0;
+    }
+    const char *b = cfg_get("OOT_GPU_POINTER_BLOCKS");
+    PT.cap = b && *b ? (uint32_t)strtoul(b, NULL, 10) : 16;
+    if (PT.cap < 1) PT.cap = 1;
+    if (PT.cap > 256) PT.cap = 256;
+    PT.n = PT_TOP + (uint64_t)PT.cap * PT_BLOCK;
+    PT.shadow = calloc(PT.n, 8);
+    PT.dirty = calloc(PT.n / PT_CHUNK + 1, 1);
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = PT.n * 8,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (!PT.shadow || !PT.dirty || vmaCreateBuffer(c->vma, &bi, &ai, &PT.buf, &PT.alloc, NULL) != VK_SUCCESS) {
+        free(PT.shadow), free(PT.dirty), PT.shadow = NULL, PT.dirty = NULL;
+        PT.on = 0;
+        rt_log("vk: pointer table off: no memory for %u blocks", PT.cap);
+        return 0;
+    }
+    InitializeCriticalSection(&pt_flush_lock);
+    {
+        VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = PT.buf};
+        PT.addr = vkGetBufferDeviceAddress(c->device, &i);
+    }
+    VkCommandBuffer cb = vk_upload_begin();   // all zero: every page unbacked until a pool fills it
+    vkCmdFillBuffer(cb, PT.buf, 0, VK_WHOLE_SIZE, 0);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    vk_upload_end();
+    const char *k = cfg_get("OOT_GPU_POINTERS_CHECK");
+    PT.check_frame = k && *k ? strtoull(k, NULL, 10) : 0;
+    PT.on = 1;
+    rt_log("vk: pointer table on: %u blocks of 2 MiB (%llu GiB of GPU addresses), %.1f MiB (OOT_GPU_POINTERS=0 turns it off)",
+           PT.cap, (unsigned long long)PT.cap, PT.n * 8 / 1048576.0);
+    return 1;
+}
+
+static VkDeviceAddress buffer_address(VkBuffer b) {
+    if (!b || !ptr_table_on()) return 0;
+    VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
+    return vkGetBufferDeviceAddress(vk_ctx()->device, &i);
+}
+
+static void pt_mark(uint64_t i) { PT.dirty[i / PT_CHUNK] = 1, PT.any_dirty = 1; }
+
+// pool_lock exclusive. The entry of the 4 KiB page at a.
+static void pt_set(uint64_t a, uint64_t v) {
+    uint64_t g = a >> 30;
+    if (g >= PT_TOP) { PT.beyond += v != 0; return; }
+    uint64_t blk = PT.shadow[g];
+    if (!blk) {
+        if (!v) return;
+        if (PT.nblocks == PT.cap) {
+            if (!PT.overflow++) rt_log("vk: pointer table full (%u blocks): GiB %#llx left unbacked (OOT_GPU_POINTER_BLOCKS)",
+                                       PT.cap, (unsigned long long)g);
+            return;
+        }
+        blk = PT_TOP + (uint64_t)PT.nblocks++ * PT_BLOCK;
+        PT.shadow[g] = blk;
+        pt_mark(g);
+    }
+    uint64_t i = blk + ((a >> 12) & (PT_BLOCK - 1));
+    if (PT.shadow[i] != v) PT.shadow[i] = v, pt_mark(i);
+}
+
+// pool_lock exclusive. Writes the pages of r's range as vk_mem_resolve backs them (clear: 0 instead).
+static void pt_fill(const PoolRec *r, int clear) {
+    if (r->kind == POOL_IMPORT) {
+        for (uint64_t a = r->import_lo; a < r->import_hi; a += 0x1000)
+            pt_set(a, clear || !r->bda ? 0 : r->bda + (a - r->import_lo));
+    } else if (r->kind == POOL_PHYS) {
+        for (uint64_t o = 0; o < r->size; o += 0x1000) pt_set(r->lo + o, clear || !r->bda ? 0 : r->bda + o);
+    } else if (r->kind == POOL_VIRT) {
+        for (uint64_t k = 0; k < r->npages; k++) {
+            const PoolRec *ph = r->pt[k].phys;
+            for (uint64_t j = 0; j < NVN_VPOOL_PAGE; j += 0x1000)
+                pt_set(r->lo + k * NVN_VPOOL_PAGE + j, clear || !ph || !ph->bda ? 0 : ph->bda + r->pt[k].off + j);
+        }
+    }
+}
+
+// pool_lock exclusive, after r left the index: its pages cleared, then those of the pools still overlapping them.
+static void pt_drop(const PoolRec *r) {
+    pt_fill(r, 1);
+    uint64_t lo = r->kind == POOL_IMPORT ? r->import_lo : r->lo, hi = r->kind == POOL_IMPORT ? r->import_hi : r->lo + r->size;
+    for (int i = 0; i < pool_index.n; i++) {
+        const PoolRec *o = pool_index.e[i].buf;
+        uint64_t olo = o->kind == POOL_IMPORT ? o->import_lo : o->lo, ohi = o->kind == POOL_IMPORT ? o->import_hi : o->lo + o->size;
+        if (olo < hi && ohi > lo) pt_fill(o, 0);
+    }
+}
+
+// Not under pool_lock (the upload batch's lock is taken after it elsewhere): the dirty chunks into the device buffer.
+static void ptr_flush(void) {
+    if (PT.on != 1) return;
+    EnterCriticalSection(&pt_flush_lock);
+    uint64_t nch = PT.n / PT_CHUNK + (PT.n % PT_CHUNK != 0), k = 0;
+    uint64_t *list = NULL, *data = NULL;
+    AcquireSRWLockShared(&pool_lock);   // a reader of the shadow; dirty bits are cleared by this one flusher only
+    if (PT.any_dirty) {
+        for (uint64_t i = 0; i < nch; i++) k += PT.dirty[i];
+        list = malloc(k * sizeof *list), data = malloc(k * PT_CHUNK * 8);
+        if (list && data) {
+            k = 0;
+            for (uint64_t i = 0; i < nch; i++)
+                if (PT.dirty[i]) {
+                    uint64_t n = i * PT_CHUNK + PT_CHUNK <= PT.n ? PT_CHUNK : PT.n - i * PT_CHUNK;
+                    memcpy(data + k * PT_CHUNK, PT.shadow + i * PT_CHUNK, n * 8);
+                    list[k++] = i, PT.dirty[i] = 0;
+                }
+            PT.any_dirty = 0;
+        } else k = 0;
+    }
+    ReleaseSRWLockShared(&pool_lock);
+    if (k) {
+        VkCommandBuffer cb = vk_upload_begin();
+        VkBuffer sb;
+        uint8_t *st = vk_staging(k * PT_CHUNK * 8, &sb, NULL);
+        if (!st) rt_fatal("vk: no staging memory for the pointer table");
+        memcpy(st, data, k * PT_CHUNK * 8);
+        VkBufferCopy *rg = malloc(k * sizeof *rg);
+        if (!rg) rt_fatal("vk: out of memory");
+        for (uint64_t j = 0; j < k; j++) {
+            uint64_t n = list[j] * PT_CHUNK + PT_CHUNK <= PT.n ? PT_CHUNK : PT.n - list[j] * PT_CHUNK;
+            rg[j] = (VkBufferCopy){j * PT_CHUNK * 8, list[j] * PT_CHUNK * 8, n * 8};
+        }
+        VkMemoryBarrier2 mb[2] = {
+            {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+             .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+             .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT},
+            {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+             .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+             .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT}};
+        VkDependencyInfo d0 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb[0]};
+        VkDependencyInfo d1 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb[1]};
+        vkCmdPipelineBarrier2(cb, &d0);   // earlier readers of the table (an older submission) before the overwrite
+        vkCmdCopyBuffer(cb, sb, PT.buf, (uint32_t)k, rg);
+        vkCmdPipelineBarrier2(cb, &d1);
+        vk_upload_end();
+        free(rg);
+    }
+    free(list), free(data);
+    LeaveCriticalSection(&pt_flush_lock);
+}
+
+uint64_t vk_mem_guest_pages(void) { return PT.on == 1 ? PT.addr : 0; }
+
+int vk_mem_ptr_table(VkBuffer *buf, VkDeviceSize *size) {
+    if (PT.on != 1) return 0;
+    *buf = PT.buf, *size = PT.n * 8;
+    return 1;
+}
+
+// OOT_GPU_POINTERS_CHECK: every page of every pool, the table's entry against vk_mem_resolve's buffer and offset.
+static void ptr_check(uint64_t frame) {
+    uint64_t pages = 0, backed = 0, bad = 0, unbacked_bad = 0;
+    AcquireSRWLockShared(&pool_lock);
+    int n = pool_index.n;
+    uint64_t (*rg)[2] = malloc((size_t)(n ? n : 1) * sizeof *rg);
+    for (int i = 0; rg && i < n; i++) {
+        const PoolRec *r = pool_index.e[i].buf;
+        rg[i][0] = r->kind == POOL_IMPORT ? r->lo & ~0xfffull : r->lo;
+        rg[i][1] = r->lo + r->size;
+    }
+    ReleaseSRWLockShared(&pool_lock);
+    for (int i = 0; rg && i < n; i++)
+        for (uint64_t a = rg[i][0]; a < rg[i][1]; a += 0x1000) {
+            pages++;
+            uint64_t g = a >> 30, blk = g < PT_TOP ? PT.shadow[g] : 0;
+            uint64_t got = blk ? PT.shadow[blk + ((a >> 12) & (PT_BLOCK - 1))] : 0;
+            VkMemSpan sp;
+            uint64_t want = vk_mem_resolve(a, 1, &sp) ? buffer_address(sp.buffer) + sp.offset : 0;
+            if (want) backed++;
+            if (got != want) {
+                if (!want) unbacked_bad++;
+                if (bad++ < 8)
+                    rt_log("vk: pointer table check: page %#llx holds %#llx, vk_mem_resolve gives %#llx",
+                           (unsigned long long)a, (unsigned long long)got, (unsigned long long)want);
+            }
+        }
+    free(rg);
+    rt_log("vk: pointer table check at frame %llu: %d pools, %llu pages (%llu backed), %llu differ (%llu where "
+           "vk_mem_resolve has nothing); %u of %u blocks used, %llu pages refused for want of a block, %llu past 39 bits",
+           (unsigned long long)frame, n, (unsigned long long)pages, (unsigned long long)backed, (unsigned long long)bad,
+           (unsigned long long)unbacked_bad, PT.nblocks, PT.cap, (unsigned long long)PT.overflow, (unsigned long long)PT.beyond);
 }
 
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
@@ -151,14 +386,14 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         r->buf = VK_NULL_HANDLE;
         return 0;
     }
-    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};   // the guest page table
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
-                                           .pNext = c->has_buffer_device_address ? &af : NULL,
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
-                               .memoryTypeIndex = (uint32_t)type};
+    // With the pointer table the import needs device addresses (VMA asks for them in its own allocations).
+    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = ptr_table_on() ? (void *)&af : (void *)&im,
+                               .allocationSize = n, .memoryTypeIndex = (uint32_t)type};
     if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
         (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
@@ -168,6 +403,7 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         r->mem = VK_NULL_HANDLE;
         return 0;
     }
+    r->bda = buffer_address(r->buf);
     InterlockedIncrement(&n_imports);
     return 1;
 }
@@ -204,6 +440,7 @@ static int alloc_physical(VkCtx *c, PoolRec *r) {
         r->alloc = NULL;
         return 0;
     }
+    r->bda = buffer_address(r->buf);
     if (vk_fix_zero()) {   // Switch pool memory starts zeroed; once per pool, not per image placed in it
         VkCommandBuffer cb = vk_upload_begin();
         vkCmdFillBuffer(cb, r->buf, 0, VK_WHOLE_SIZE, 0);
@@ -246,93 +483,6 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     free(r);
 }
 
-// ---------------------------------------------------------------- guest page table
-// Shaders follow pointers into any guest memory (patch 0024, in xlate/wip): an address no constant buffer entry traces
-// is looked up here, on the GPU. Two levels over 40-bit guest addresses: a directory of 1024 entries (one per GiB),
-// each the device address of a block of 262144 entries (one per 4 KiB page), each the device address of the page's
-// first byte in the buffer backing it (an import's host buffer, a physical pool's buffer, or through a virtual pool's
-// page the physical pool's). Unbacked pages point at a zeroed page and unused GiBs at a block of those, so a lookup
-// never meets a null pointer. Host-visible buffers, written under pool_lock as pools come, map and go; the support
-// buffer gives shaders the directory's address (vk_exec_draw.c support_fill). The design follows Hookshot's
-// gpu/vk/vk_memory.cpp memory_guest_pages (MIT, Copyright (c) 2026 NotRexed: one level over 8 GiB there); the code is
-// ours. Mirrors are not followed: the pages are the guest's own memory, as the CPU sees it.
-enum { GPT_DIR = 1024, GPT_BLOCK = 1u << 18, GPT_ZERO = 0x10000 };
-typedef struct { VkBuffer b; VmaAllocation a; uint64_t *map; uint64_t addr; } GptBuf;
-static struct {
-    int state;                         // 0 not tried, 1 on, -1 off (no buffer device address)
-    GptBuf dir, zero, zblock, block[GPT_DIR];
-} G;
-
-static uint64_t buf_addr(VkBuffer b) {
-    VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
-    return vkGetBufferDeviceAddress(vk_ctx()->device, &i);
-}
-
-static int gpt_buf(uint64_t size, GptBuf *o) {
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
-                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
-    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                                  .usage = VMA_MEMORY_USAGE_AUTO};
-    VmaAllocationInfo info;
-    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &o->b, &o->a, &info) != VK_SUCCESS || !info.pMappedData) return 0;
-    o->map = info.pMappedData;
-    o->addr = buf_addr(o->b);
-    return o->addr != 0;
-}
-
-static void gpt_fill(GptBuf *b, uint64_t n, uint64_t v) {
-    for (uint64_t i = 0; i < n; i++) b->map[i] = v;
-    vmaFlushAllocation(vk_ctx()->vma, b->a, 0, VK_WHOLE_SIZE);
-}
-
-// pool_lock exclusive.
-static int gpt_on(void) {
-    if (G.state) return G.state > 0;
-    G.state = -1;
-    if (!vk_ctx()->has_buffer_device_address) {
-        rt_log("vk: no buffer device address: shaders read 0 through untraced pointers");
-        return 0;
-    }
-    if (!gpt_buf(GPT_ZERO, &G.zero) || !gpt_buf((uint64_t)GPT_BLOCK * 8, &G.zblock) || !gpt_buf(GPT_DIR * 8, &G.dir)) {
-        rt_log("vk: the guest page table could not be made: shaders read 0 through untraced pointers");
-        return 0;
-    }
-    memset(G.zero.map, 0, GPT_ZERO);
-    vmaFlushAllocation(vk_ctx()->vma, G.zero.a, 0, VK_WHOLE_SIZE);
-    gpt_fill(&G.zblock, GPT_BLOCK, G.zero.addr);
-    gpt_fill(&G.dir, GPT_DIR, G.zblock.addr);
-    G.state = 1;
-    rt_log("vk: guest page table at %#llx", (unsigned long long)G.dir.addr);
-    return 1;
-}
-
-// Guest pages [lo, hi) to the buffer whose first byte backs guest address base (dev 0: unbacked). pool_lock exclusive.
-static void gpt_set(uint64_t lo, uint64_t hi, VkBuffer buf, uint64_t base) {
-    if (!gpt_on()) return;
-    uint64_t dev = buf ? buf_addr(buf) : 0;
-    int touched = -1;
-    for (uint64_t p = lo & ~0xfffull; p < hi; p += 0x1000) {
-        uint64_t d = p >> 30;
-        if (d >= GPT_DIR) break;
-        GptBuf *b = &G.block[d];
-        if (!b->b) {
-            if (!dev) continue;   // nothing to clear in an untouched GiB
-            if (!gpt_buf((uint64_t)GPT_BLOCK * 8, b)) { rt_log("vk: guest page table block %llu failed", (unsigned long long)d); return; }
-            gpt_fill(b, GPT_BLOCK, G.zero.addr);
-            G.dir.map[d] = b->addr;
-            vmaFlushAllocation(vk_ctx()->vma, G.dir.a, 0, VK_WHOLE_SIZE);
-        }
-        b->map[(p >> 12) & (GPT_BLOCK - 1)] = dev && p >= base ? dev + (p - base) : G.zero.addr;
-        if (touched != (int)d) {
-            if (touched >= 0) vmaFlushAllocation(vk_ctx()->vma, G.block[touched].a, 0, VK_WHOLE_SIZE);
-            touched = (int)d;
-        }
-    }
-    if (touched >= 0) vmaFlushAllocation(vk_ctx()->vma, G.block[touched].a, 0, VK_WHOLE_SIZE);
-}
-
-uint64_t vk_mem_guest_pages(void) { return G.state > 0 ? G.dir.addr : 0; }
-
 int vk_pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
@@ -371,9 +521,7 @@ int vk_pool_init(pool_t *p) {
     if (!ok) { free(r->pt); free(r); return 0; }
     AcquireSRWLockExclusive(&pool_lock);
     index_put(r);
-    if (r->kind == POOL_IMPORT && r->buf) gpt_set(r->lo, r->lo + r->size, r->buf, r->import_lo);
-    else if (r->kind == POOL_PHYS) gpt_set(r->lo, r->lo + r->size, r->buf, r->lo);
-    else gpt_on();
+    if (PT.on == 1) pt_fill(r, 0);
     if (r->kind == POOL_PHYS) {
         if (nphys == cap_phys) {
             cap_phys = cap_phys ? cap_phys * 2 : 16;
@@ -383,6 +531,7 @@ int vk_pool_init(pool_t *p) {
         phys_list[nphys++] = r;
     }
     ReleaseSRWLockExclusive(&pool_lock);
+    ptr_flush();
     return 1;
 }
 
@@ -395,7 +544,6 @@ void vk_pool_fini(pool_t *p) {
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     PoolRec *r = had ? e.buf : NULL;
     if (r && r->mstate == MS_ON) mirror_forget(r);
-    if (r) gpt_set(r->lo, r->lo + r->size, VK_NULL_HANDLE, 0);
     if (r && r->kind == POOL_PHYS) {
         for (int i = 0; i < nphys; i++)
             if (phys_list[i] == r) { phys_list[i] = phys_list[--nphys]; break; }
@@ -403,13 +551,13 @@ void vk_pool_fini(pool_t *p) {
             PoolRec *v = pool_index.e[i].buf;
             if (v->kind != POOL_VIRT) continue;
             for (uint64_t k = 0; k < v->npages; k++)
-                if (v->pt[k].phys == r) {
-                    v->pt[k].phys = NULL;
-                    gpt_set(v->lo + k * NVN_VPOOL_PAGE, v->lo + (k + 1) * NVN_VPOOL_PAGE, VK_NULL_HANDLE, 0);
-                }
+                if (v->pt[k].phys == r) v->pt[k].phys = NULL;
+            if (PT.on == 1) pt_fill(v, 0);   // its pages that mapped r are unbacked now
         }
     }
+    if (r && PT.on == 1) pt_drop(r);
     ReleaseSRWLockExclusive(&pool_lock);
+    ptr_flush();
     if (!r) return;
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
@@ -446,13 +594,12 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
         }
         uint64_t first = (uint64_t)rq[i].virtual_offset / NVN_VPOOL_PAGE, count = rq[i].size / NVN_VPOOL_PAGE;
         if (first + count > r->npages) { ok = 0; break; }
-        for (uint64_t k = 0; k < count; k++) {
-            uint64_t off = ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0, va = r->lo + (first + k) * NVN_VPOOL_PAGE;
-            r->pt[first + k] = (VPage){ph, off};
-            gpt_set(va, va + NVN_VPOOL_PAGE, ph ? ph->buf : VK_NULL_HANDLE, va - off);   // dev + off + (p - va)
-        }
+        for (uint64_t k = 0; k < count; k++)
+            r->pt[first + k] = (VPage){ph, ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0};
     }
+    if (r && r->kind == POOL_VIRT && PT.on == 1) pt_fill(r, 0);
     ReleaseSRWLockExclusive(&pool_lock);
+    ptr_flush();
     if (!ok) rt_log("vk: MapVirtual on pool %p failed", (void *)v->mem);
     return ok;
 }
@@ -601,6 +748,7 @@ static void vram_log(uint64_t frame);
 
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    if (PT.on == 1 && PT.check_frame && frame == PT.check_frame) ptr_check(frame);
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800) mirror_log(frame);   // and the
@@ -1947,4 +2095,9 @@ void vk_mem_shutdown(void) {
     AcquireSRWLockExclusive(&gen_lock);
     for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL;
     ReleaseSRWLockExclusive(&gen_lock);
+    if (PT.on == 1) {   // the pointer table, before vmaDestroyAllocator (it asserts on allocations left)
+        vmaDestroyBuffer(c->vma, PT.buf, PT.alloc);
+        free(PT.shadow), free(PT.dirty);
+        PT.buf = VK_NULL_HANDLE, PT.alloc = NULL, PT.shadow = NULL, PT.dirty = NULL, PT.addr = 0, PT.on = 0;
+    }
 }
