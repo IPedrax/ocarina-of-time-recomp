@@ -3168,7 +3168,8 @@ static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
     int added = 0;
     ptr_slots[st] = 0;
     static int off = -1, off_gfx;   // OOT_PTR_BIND=0 (diagnostic): no pointer targets bound; OOT_PTR_BIND_GFX=0: none for draws
-    static uint64_t span_max;   // OOT_PTR_SPAN=<bytes> (diagnostic): the most a target binds
+    static uint64_t span_max, scan_max;   // OOT_PTR_SPAN=<bytes> (diagnostic): the most a target binds; OOT_PTR_SCAN=<bytes>:
+                                          // the largest bound buffer scanned for pointers (default PTR_SCAN)
     if (off < 0) {
         const char *e = getenv("OOT_PTR_BIND");
         off = e && !strcmp(e, "0");
@@ -3177,11 +3178,19 @@ static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
         e = getenv("OOT_PTR_SPAN");
         span_max = e && *e ? strtoull(e, NULL, 0) : PTR_SPAN;
         if (e && *e) rt_log("vk_exec: OOT_PTR_SPAN: pointer targets bind at most %llu bytes", (unsigned long long)span_max);
+        e = getenv("OOT_PTR_SCAN");
+        scan_max = e && *e ? strtoull(e, NULL, 0) : PTR_SCAN;
+        if (e && *e) rt_log("vk_exec: OOT_PTR_SCAN: bound buffers up to %llu bytes are scanned for pointers", (unsigned long long)scan_max);
     }
     if (off || (st != NVN_STAGE_CS && off_gfx)) return 0;
-    for (int k = 0; k < 16; k++) {
-        uint64_t base = saved[k].addr, size = saved[k].size;
-        if (!base || !size || size > PTR_SCAN || (base & 7) || !ptr_readable(base, size)) continue;
+    // Pointers sit in uniform buffers too: the level's culling kernel e6d5432f counts with RED.ADD through a table
+    // of pointers to the indirect dispatch and mesh records in its uniform slot 1 (bank 4, read with LDC c[4][Rn]);
+    // with none of the records bound, every count was dropped and the mesh draws drew nothing (docs/level.md,
+    // 2026-11-08). Sources 0-15 are the storage slots as the game bound them, 16-33 the uniform slots.
+    for (int k = 0; k < 16 + 18; k++) {
+        const p_bind_buf *src = k < 16 ? &saved[k] : &ex->ubo[st][k - 16];
+        uint64_t base = src->addr, size = src->size;
+        if (!base || !size || size > scan_max || (base & 7) || !ptr_readable(base, size)) continue;
         for (uint64_t o = 0; o + 8 <= size; o += 8) {
             uint64_t v = *(const uint64_t *)(uintptr_t)(base + o);
             if (v < 0x10000 || (v >> 40) || (v & 3)) continue;
@@ -3202,10 +3211,10 @@ static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
             for (int i = 0; i < nseen && fresh; i++) fresh = seen[i] != where;
             if (fresh) seen[nseen++] = where;
             if (fresh)
-                rt_log("vk_exec: pointer %#llx at %#llx+%#llx of %s storage slot %d bound to free slot %d (%llu bytes)",
+                rt_log("vk_exec: pointer %#llx at %#llx+%#llx of %s %s slot %d bound to free slot %d (%llu bytes)",
                        (unsigned long long)v, (unsigned long long)base, (unsigned long long)o,
                        st == NVN_STAGE_CS ? "compute" : st == NVN_STAGE_VS ? "vertex" : st == NVN_STAGE_TS ? "task" :
-                       st == NVN_STAGE_MS ? "mesh" : "fragment", k, free_slot,
+                       st == NVN_STAGE_MS ? "mesh" : "fragment", k < 16 ? "storage" : "uniform", k < 16 ? k : k - 16, free_slot,
                        (unsigned long long)sb[free_slot].size);
         }
     }
