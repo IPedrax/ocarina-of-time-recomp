@@ -1658,6 +1658,13 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
 #define MI_N 8
 static struct { VkBuffer b; VkDeviceSize o; uint64_t addr; uint64_t prog; } MI[MI_N];
 static int nmi, mi_logged, mi_on = -1;
+static uint64_t mi_from;   // OOT_MESH_IND_LOG=1 from the start, =<frame> from that frame on
+static int mi_init(void) {
+    const char *e = cfg_get("OOT_MESH_IND_LOG");
+    if (!e || !*e || *e == '0') return 0;
+    mi_from = strtoull(e, NULL, 10);
+    return 1;
+}
 static VkBuffer mi_buf;
 static VmaAllocation mi_alloc;
 static const uint32_t *mi_map;
@@ -3242,8 +3249,8 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
         VkMemSpan ip;
         if (!vk_mem_resolve(d->ind, 12, &ip) || ip.offset % 4)
             return warn_once(W_INDIRECT, "indirect mesh arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
-        if (mi_on < 0) mi_on = cfg_get("OOT_MESH_IND_LOG") && *cfg_get("OOT_MESH_IND_LOG") == '1';
-        if (mi_on && nmi < MI_N && mi_logged < 48)
+        if (mi_on < 0) mi_on = mi_init();
+        if (mi_on && nmi < MI_N && mi_logged < 48 && gfx_counters.frames >= mi_from)
             MI[nmi].b = ip.buffer, MI[nmi].o = ip.offset, MI[nmi].addr = d->ind, MI[nmi].prog = ex->prog->serial, nmi++;
         rec_mesh_tasks_ind(draw_ind_fn, ex->cb, ip.buffer, ip.offset, 1, 12);
         vk_mem_count(ip.cls, VK_MUSE_IND, 12);
@@ -3279,8 +3286,8 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         return;
     }
     if (skip_cs(cs)) return;
-    if (mi_on < 0) mi_on = cfg_get("OOT_MESH_IND_LOG") && *cfg_get("OOT_MESH_IND_LOG") == '1';
-    if (mi_on && nmi < MI_N && mi_logged < 48)   // OOT_MESH_IND_LOG: dispatch arguments too (program serial tagged odd)
+    if (mi_on < 0) mi_on = mi_init();
+    if (mi_on && nmi < MI_N && mi_logged < 48 && gfx_counters.frames >= mi_from)   // OOT_MESH_IND_LOG: dispatch arguments too (program serial tagged odd)
         MI[nmi].b = ip.buffer, MI[nmi].o = ip.offset, MI[nmi].addr = d->ind, MI[nmi].prog = ex->prog->serial | 1ull << 63, nmi++;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
