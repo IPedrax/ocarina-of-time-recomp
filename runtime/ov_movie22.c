@@ -197,7 +197,10 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
         Dav1dSettings s;
         dav1d_default_settings(&s);
         s.n_threads = 4;
-        s.max_frame_delay = 1;           // every sample's picture comes out at once: the game paces by time stamps
+        // Frame delay 2 gives dav1d frame threads: at 1 the castle cinematic took 36 to 39 ms a picture whatever the
+        // thread count and skipped most of them; at 2 it takes 8 to 13 ms and skips none (Ryzen 5 5600GT, dav1d 1.5.4).
+        // A sample's picture can now come out with the next sample; the ring and the game pace by time stamps.
+        s.max_frame_delay = 2;
         // Tuning (Linux test runs): OOT_MOVIE_THREADS, OOT_MOVIE_DELAY, OOT_MOVIE_GRAIN=0 (no film grain synthesis).
         const char *e;
         if ((e = cfg_get("OOT_MOVIE_THREADS")) && atoi(e) > 0) s.n_threads = atoi(e);
@@ -345,7 +348,8 @@ static void ready_drop_oldest(Dec *d) {
 
 typedef struct { Dav1dPicture pic[8]; int n; } Out;      // pictures of one sample, from dav1d to the ring
 
-// dav_lock held: the pictures dav1d has finished (max_frame_delay 1 gives one per sample; more than 8 are dropped).
+// dav_lock held: the pictures dav1d has finished (a sample gives none or one with max_frame_delay 2, a stream's end
+// flushes the rest; more than 8 at once are dropped).
 static void drain(Dec *d, Out *o) {
     for (;;) {
         Dav1dPicture pic;
