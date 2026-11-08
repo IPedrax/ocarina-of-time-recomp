@@ -463,7 +463,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         b_reg = 1;
     int c_reg = base < 0x100 ? 1 : 0;                              // ALU: a register at 64 in every form
     int store = base == 0x186 || base == 0x187 || base == 0x188 || base == 0x122 || base == 0x18e || base == 0x127 ||
-                base == 0x19b || base == 0x19c || base == 0x19e || base == 0x19f;
+                base == 0x19b || base == 0x19c || base == 0x19e;
     int no_dst = store || base == 0x118 || base == 0x11a || base == 0x192 || base == 0x11d || base == 0x004 || base == 0x01c ||
                  (base == 0x00b) || (base == 0x00c) || (base == 0x034);   // FSETP, ISETP, HSETP2: predicates only
     // The destination's width: loads by their size (73-75: 6 = 128 bits, 5 = 64), texture ops by their mask (the
@@ -503,10 +503,6 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         else set_run(use, f16, 2);
     }
     if (base == 0x03b && !predicated) set_run(def, f16, 1u << bits(x, 72, 2));   // LDSM: count registers
-    if (base == 0x19f) {                                          // SURED: coordinates by the dimension, one data register
-        static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
-        set_run(use, f24, coords[bits(x, 61, 3)]);
-    }
     if (base == 0x19b) {                                          // SUST: coordinates by the dimension, data by the mask
         static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
         set_run(use, f24, coords[bits(x, 61, 3)]);
@@ -1713,24 +1709,6 @@ static void lower_suld(L *l, const Insn *x) {
     if (!cbuf_ok(&h)) return (void)fail(l, "SULD handle");
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     emit(l, 0xeb00000000000000ull | l->pred | rd | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)PT << 30) |
-                ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
-}
-
-// SURED (0x59f, 2026-11-06: the Great Deku Tree scene's compute kernel b9141b0b, 1164 requests): a reduction of one
-// 32-bit value into a surface texel. Data 32-39, coordinates 24-31, the handle's constant word as SUST's (index 40-53,
-// bank 54-58), dimension 61-63 (1 buffer, 3 2D), reduction 87-89 (Add, Min, Max, Inc, Dec, And, Or, Xor on both
-// sides); the rest of the word must be the one seen (U32, strong, GPU scope). Maxwell SURED.B (bindless, Ryujinx
-// InstSuredB): data 0-7, coordinates 8-15, size 20-22 (U32 = 0), operation 24-26, dimension 33-35, handle 39-46.
-// Fields as Lichii's Ampere front end reads them (GPL, for the field meanings only).
-static void lower_sured(L *l, const Insn *x) {
-    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 8), dim = bits(x, 61, 3);
-    if ((x->w[2] & ~0x03800000u) != 0x0010e000u || (dim != 1 && dim != 3) || bits(x, 59, 2) || coord > 253)
-        return (void)fail(l, "SURED mode");
-    Src h = {0};
-    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
-    if (!cbuf_ok(&h)) return (void)fail(l, "SURED handle");
-    uint32_t hr = to_reg(l, h, 4, 0, 0);
-    emit(l, 0xeb50000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)bits(x, 87, 3) << 24) |
                 ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
 }
 
@@ -3130,7 +3108,6 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
     case 0xb9b: return lower_sust(l, x);
     case 0xb97: return lower_suld(l, x);
-    case 0x59f: return lower_sured(l, x);
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
     case 0x234: case 0x434: return lower_hsetp2(l, x, op);
