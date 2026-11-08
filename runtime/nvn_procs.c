@@ -48,10 +48,10 @@ static int stub_log_n(void) {
 static void stub_log(const char *name, Cpu *c, long k) {
     char at[128], peek[80] = "";
     if (strstr(name, "Indirect")) {
-        MEMORY_BASIC_INFORMATION mi;
+        uint64_t end;
         const uint32_t *p = (const uint32_t *)(uintptr_t)c->x[1];
-        if (VirtualQuery(p, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
-            (const uint8_t *)p + 16 <= (const uint8_t *)mi.BaseAddress + mi.RegionSize)
+        int st = plat_mem_state((uint64_t)(uintptr_t)p, (uint64_t)(uintptr_t)p + 16, &end);
+        if ((st == PLAT_PROT_READ || st == PLAT_PROT_RW) && end >= (uint64_t)(uintptr_t)p + 16)
             snprintf(peek, sizeof peek, "; [x1] %08x %08x %08x %08x", p[0], p[1], p[2], p[3]);
     }
     rt_log("nvn2 stub %s #%ld from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx%s (returns 0)", name, k,

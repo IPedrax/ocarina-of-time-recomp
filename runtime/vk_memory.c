@@ -137,7 +137,24 @@ static struct {
     VkDeviceAddress addr;                      // buf's device address (the support buffer hands it to shaders)
     uint64_t check_frame;
 } PT = {.on = -1};
-static CRITICAL_SECTION pt_flush_lock;         // ptr_flush: one copy at a time, in the order of the changes
+static PlatMutex pt_flush_lock = PLAT_MUTEX_INIT;   // ptr_flush: one copy at a time, in the order of the changes
+static uint32_t pt_flush_owner;                    // recursive, as the CRITICAL_SECTION it was on Windows
+static int pt_flush_depth;
+static void pt_flush_enter(void) {
+    uint32_t me = plat_thread_id();
+    if (__atomic_load_n(&pt_flush_owner, __ATOMIC_ACQUIRE) == me) {
+        pt_flush_depth++;
+        return;
+    }
+    plat_mutex_lock(&pt_flush_lock);
+    __atomic_store_n(&pt_flush_owner, me, __ATOMIC_RELEASE);
+    pt_flush_depth = 1;
+}
+static void pt_flush_leave(void) {
+    if (--pt_flush_depth) return;
+    __atomic_store_n(&pt_flush_owner, 0, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&pt_flush_lock);
+}
 
 static int ptr_table_on(void) {
     if (PT.on >= 0) return PT.on;
@@ -167,7 +184,6 @@ static int ptr_table_on(void) {
         rt_log("vk: pointer table off: no memory for %u blocks", PT.cap);
         return 0;
     }
-    InitializeCriticalSection(&pt_flush_lock);
     {
         VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = PT.buf};
         PT.addr = vkGetBufferDeviceAddress(c->device, &i);
@@ -246,10 +262,10 @@ static void pt_drop(const PoolRec *r) {
 // Not under pool_lock (the upload batch's lock is taken after it elsewhere): the dirty chunks into the device buffer.
 static void ptr_flush(void) {
     if (PT.on != 1) return;
-    EnterCriticalSection(&pt_flush_lock);
+    pt_flush_enter();
     uint64_t nch = PT.n / PT_CHUNK + (PT.n % PT_CHUNK != 0), k = 0;
     uint64_t *list = NULL, *data = NULL;
-    AcquireSRWLockShared(&pool_lock);   // a reader of the shadow; dirty bits are cleared by this one flusher only
+    plat_mutex_lock_shared(&pool_lock);   // a reader of the shadow; dirty bits are cleared by this one flusher only
     if (PT.any_dirty) {
         for (uint64_t i = 0; i < nch; i++) k += PT.dirty[i];
         list = malloc(k * sizeof *list), data = malloc(k * PT_CHUNK * 8);
@@ -264,7 +280,7 @@ static void ptr_flush(void) {
             PT.any_dirty = 0;
         } else k = 0;
     }
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     if (k) {
         VkCommandBuffer cb = vk_upload_begin();
         VkBuffer sb;
@@ -293,7 +309,7 @@ static void ptr_flush(void) {
         free(rg);
     }
     free(list), free(data);
-    LeaveCriticalSection(&pt_flush_lock);
+    pt_flush_leave();
 }
 
 uint64_t vk_mem_guest_pages(void) { return PT.on == 1 ? PT.addr : 0; }
@@ -307,7 +323,7 @@ int vk_mem_ptr_table(VkBuffer *buf, VkDeviceSize *size) {
 // OOT_GPU_POINTERS_CHECK: every page of every pool, the table's entry against vk_mem_resolve's buffer and offset.
 static void ptr_check(uint64_t frame) {
     uint64_t pages = 0, backed = 0, bad = 0, unbacked_bad = 0;
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     int n = pool_index.n;
     uint64_t (*rg)[2] = malloc((size_t)(n ? n : 1) * sizeof *rg);
     for (int i = 0; rg && i < n; i++) {
@@ -315,7 +331,7 @@ static void ptr_check(uint64_t frame) {
         rg[i][0] = r->kind == POOL_IMPORT ? r->lo & ~0xfffull : r->lo;
         rg[i][1] = r->lo + r->size;
     }
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     for (int i = 0; rg && i < n; i++)
         for (uint64_t a = rg[i][0]; a < rg[i][1]; a += 0x1000) {
             pages++;

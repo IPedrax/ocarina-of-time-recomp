@@ -445,10 +445,10 @@ NVN_API(nvnCommandBufferCopyCommands) {
 // CopyTextureToBuffer. Kernel stores through bound buffers are not seen here (frame dumps list those bindings).
 // OOT_GPU_WATCH_FROM=<frame> starts it at that frame; at most 256 lines a run.
 #define GW_N 8
-static struct { int on; uint64_t from; int n; volatile LONG logged; uint64_t lo[GW_N], hi[GW_N]; } GW;
-static INIT_ONCE gw_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK gw_init(PINIT_ONCE once, void *param, void **ctx) {   // once: command buffers record on several threads
-    (void)once, (void)param, (void)ctx;
+static struct { int on; uint64_t from; int n; int32_t logged; uint64_t lo[GW_N], hi[GW_N]; } GW;
+static PlatMutex gw_lock = PLAT_MUTEX_INIT;
+static int gw_done;
+static void gw_init(void) {   // once: command buffers record on several threads
     const char *e = cfg_get("OOT_GPU_WATCH");
     for (const char *p = e; p && *p && GW.n < GW_N;) {
         char *q;
@@ -462,14 +462,17 @@ static BOOL CALLBACK gw_init(PINIT_ONCE once, void *param, void **ctx) {   // on
     GW.from = f && *f ? strtoull(f, NULL, 10) : 0;
     GW.on = GW.n > 0;
     if (GW.on) rt_log("nvn: GPU watch on %d range(s) from frame %llu (OOT_GPU_WATCH)", GW.n, (unsigned long long)GW.from);
-    return TRUE;
 }
 static void gpu_watch(Cpu *c, const char *what, uint64_t dst, uint64_t size, uint64_t extra) {
-    InitOnceExecuteOnce(&gw_once, gw_init, NULL, NULL);
+    if (!__atomic_load_n(&gw_done, __ATOMIC_ACQUIRE)) {
+        plat_mutex_lock(&gw_lock);
+        if (!gw_done) gw_init(), __atomic_store_n(&gw_done, 1, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&gw_lock);
+    }
     if (!GW.on || GW.logged >= 256 || gfx_stats().frames < GW.from) return;
     for (int i = 0; i < GW.n; i++)
         if (dst < GW.hi[i] && dst + (size ? size : 1) > GW.lo[i]) {
-            if (InterlockedIncrement(&GW.logged) > 256) return;
+            if (__atomic_add_fetch(&GW.logged, 1, __ATOMIC_SEQ_CST) > 256) return;
             rt_log("nvn: GPU watch: frame %llu %s to %#llx+%#llx (%#llx) from main+%#llx",
                    (unsigned long long)gfx_stats().frames, what, (unsigned long long)dst, (unsigned long long)size,
                    (unsigned long long)extra, (unsigned long long)(c->x[30] - 0x7000000000ull));
@@ -720,16 +723,16 @@ static void draw_trace(Cpu *c, const char *what) {
 // once, stage by stage, with the FNV-1a hash of the stage's control section (the census's ctl/<key>.ctl, its size at
 // +0xd4) and its stage byte (+0x56: 6 task, 7 mesh), so the mesh programs the game uses can be told apart.
 void nvn_diag_mesh_draw(const char *entry) {
-    static SRWLOCK lock = SRWLOCK_INIT;
+    static PlatMutex lock = PLAT_MUTEX_INIT;
     static uint64_t seen[64];
     static int nseen;
     const prog_t *p = bound_prog;
     if (!p) return;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     int known = 0;
     for (int i = 0; i < nseen && !known; i++) known = seen[i] == p->serial;
     if (!known && nseen < 64) seen[nseen++] = p->serial;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (known || nseen >= 64) return;
     char line[512];
     int o = snprintf(line, sizeof line, "nvn2 mesh draw (%s): program %llu,", entry, (unsigned long long)p->serial);

@@ -54,7 +54,7 @@ static int stop;                  // set by vk_sync_shutdown, checked by the thr
 // ---- OOT_FENCE_TRACE=1 (diagnostic): the completion thread's stage, so a stall says who is blocked.
 // ft_stage: 0 idle, 1 inside a completion callback, 2 inside vk_mem_collect, 3 inside the timeline wait.
 static int ftrace = -1;
-static volatile LONG64 ft_stage, ft_last_cb, ft_waits, ft_cur_fence;
+static volatile int64_t ft_stage, ft_last_cb, ft_waits, ft_cur_fence;
 static void ft_init(void) {
     if (ftrace >= 0) return;
     const char *e = cfg_get("OOT_FENCE_TRACE");
@@ -69,19 +69,19 @@ static void ft_set(int stage) { if (ftrace > 0) __atomic_store_n(&ft_stage, stag
 // Exported so the replay can mark its own stages (vk_exec_draw.c op_dispatch): the innermost mark is what a stall needs.
 void vk_trace_stage(int s) { ft_set(s); }
 int vk_trace_enabled(void) { return ftrace > 0; }
-static volatile LONG64 ft_cstage;   // the completion thread's own stage: it polls the timeline every 100 ms and must not
+static volatile int64_t ft_cstage;   // the completion thread's own stage: it polls the timeline every 100 ms and must not
                                     // overwrite the submit path's stage, which is what a stall needs to show
 static void ft_cset(int stage) { if (ftrace > 0) __atomic_store_n(&ft_cstage, stage, __ATOMIC_RELEASE); }
 
 // Says, once a second, what the completion thread is doing while `done` stops advancing behind `issued`.
 // Also prints a heartbeat every 5 s, so a stall shows the stage the submit path is stuck in.
-static DWORD WINAPI ft_watch_main(void *arg) {
+static void ft_watch_main(void *arg) {
     VkCtx *c = arg;
     uint64_t last = 0;
     int still = 0, beat = 0;
     for (;;) {
-        Sleep(1000);
-        if (__atomic_load_n(&stop, __ATOMIC_ACQUIRE)) return 0;
+        plat_sleep_ns(1000000000ull);
+        if (__atomic_load_n(&stop, __ATOMIC_ACQUIRE)) return;
         uint64_t d = __atomic_load_n(&done, __ATOMIC_ACQUIRE), i = __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
         if (d == last && i > d) {
             if (++still == 2) {
@@ -577,7 +577,7 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
         uint64_t t0 = kern_now_ns();
         if (ftrace > 0 && value > done) {
             // Counted always, logged for the first 64: a frame waits several times, and the count is in the heartbeat.
-            if (InterlockedIncrement64(&ft_waits) <= 64)
+            if (__atomic_add_fetch(&ft_waits, 1, __ATOMIC_SEQ_CST) <= 64)
                 rt_log("fence: wait %llu issued=%llu done=%llu", (unsigned long long)value,
                        (unsigned long long)issued, (unsigned long long)done);
         }

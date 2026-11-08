@@ -526,10 +526,10 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
         // which stage kinds the game's programs carry (the level draws with mesh tasks, 2026-11-06).
         static uint32_t seen[64];
         static int nseen;
-        static SRWLOCK lk = SRWLOCK_INIT;
+        static PlatMutex lk = PLAT_MUTEX_INIT;
         uint32_t key = (uint32_t)n;
         for (int i = 0; i < n && i < 6; i++) key |= (uint32_t)(sd[i].control ? ((const uint8_t *)sd[i].control)[0x56] & 0xf : 0xf) << (4 + 4 * i);
-        AcquireSRWLockExclusive(&lk);
+        plat_mutex_lock(&lk);
         int found = 0;
         for (int i = 0; i < nseen; i++) found |= seen[i] == key;
         if (!found && nseen < 64) {
@@ -538,12 +538,12 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
             for (int i = 0; i < n && i < 6; i++) snprintf(buf + strlen(buf), sizeof buf - strlen(buf), " %u", key >> (4 + 4 * i) & 0xf);
             rt_log("nvn: a program with %d stages, NVN2 stage numbers%s", n, buf);
         }
-        ReleaseSRWLockExclusive(&lk);
+        plat_mutex_unlock(&lk);
         // OOT_MESH_DUMP=<dir> (diagnostic): the control block (0x400 bytes) and code of every stage of the first 12
         // programs with a task (6) or mesh (7) stage, as <k>_s<stage>.ctl / .code, for tools/sm86_dis.py.
         // OOT_MESH_DUMP_STAGE=<n>: only programs with stage n (6: task programs). A program whose stages' code is
         // the same as one dumped before (the first 16 bytes after the header and the length) is not dumped again.
-        static volatile LONG dumped;
+        static int32_t dumped;
         static uint64_t done_sig[64];
         static int ndone;
         const char *dir = cfg_get("OOT_MESH_DUMP"), *want = cfg_get("OOT_MESH_DUMP_STAGE");
@@ -564,21 +564,21 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
             }
         }
         if (mesh && wanted && dir && *dir) {
-            AcquireSRWLockExclusive(&lk);
+            plat_mutex_lock(&lk);
             for (int i = 0; i < ndone; i++) wanted &= done_sig[i] != sig;
             if (wanted && ndone < 64) done_sig[ndone++] = sig;
-            ReleaseSRWLockExclusive(&lk);
+            plat_mutex_unlock(&lk);
         }
-        LONG k = mesh && wanted && dir && *dir ? InterlockedIncrement(&dumped) : 0;
+        int32_t k = mesh && wanted && dir && *dir ? __atomic_add_fetch(&dumped, 1, __ATOMIC_SEQ_CST) : 0;
         for (int i = 0; k && k <= 12 && i < n; i++) {
             const uint8_t *ctl = sd[i].control;
             if (!ctl || !sd[i].data) continue;
             uint32_t len;
             memcpy(&len, ctl + 0x44, 4);
             char path[600];
-            snprintf(path, sizeof path, "%s\\%02ld_s%u.ctl", dir, (long)k, ctl[0x56]);
+            snprintf(path, sizeof path, "%s/%02ld_s%u.ctl", dir, (long)k, ctl[0x56]);
             plat_file_write(path, ctl, 0x400);
-            snprintf(path, sizeof path, "%s\\%02ld_s%u.code", dir, (long)k, ctl[0x56]);
+            snprintf(path, sizeof path, "%s/%02ld_s%u.code", dir, (long)k, ctl[0x56]);
             if (len < (16u << 20)) plat_file_write(path, (const void *)(uintptr_t)sd[i].data, len);
         }
     }

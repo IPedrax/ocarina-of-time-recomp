@@ -175,10 +175,9 @@ static void obs_abort_impl(Cpu *c) {
 HOST_OBSERVER("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i", obs_abort_impl);
 
 static int guest_ok(uint64_t a, uint64_t n) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!a || !VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    uint64_t end;
+    int st = a ? plat_mem_state(a, a + n, &end) : PLAT_MEM_FREE;
+    return (st == PLAT_PROT_READ || st == PLAT_PROT_RW) && end >= a + n;
 }
 
 // nn::diag::detail::AbortImpl(), the argument-less form, which the SDK reaches through its own PLT. The start-up

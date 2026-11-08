@@ -294,13 +294,13 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
 // two counter words, how each was read, the result) and the counter reports, for finding objects that flicker.
 static int cond_log_on(void) {
     static int64_t from = -2;
-    static volatile LONG n;
+    static int32_t n;
     if (from == -2) {
         const char *e = cfg_get("OOT_COND_LOG");
         from = e && *e ? (int64_t)strtoull(e, NULL, 10) : -1;
     }
     if (from < 0 || (int64_t)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < from) return 0;
-    return InterlockedIncrement(&n) <= 400;
+    return __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 400;
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {

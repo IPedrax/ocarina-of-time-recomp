@@ -592,8 +592,8 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     VkFormat vf = storage && img->storage_format ? img->storage_format : img->format;   // sRGB stored through UNORM
     VkFormat rf = reinterpret_format(img, v, hv, storage);
     if (rf) {
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 8)
+        static int32_t said;
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 8)
             rt_log("vk_exec: %s view of image %#llx (%ux%u vk format %d) in its view format %d", storage ? "storage" : "sampled",
                    (unsigned long long)img->addr, img->width, img->height, (int)img->format, (int)rf);
         vf = rf;
@@ -1788,15 +1788,7 @@ static struct { uint64_t syncs, scans, resolves, writes, binds, fb_reads; double
 static const uint16_t pool_rtype[GFX_POOL_BINDINGS] = {0, 1, 3, 4, 5, 0x101, 0x103, 0x105};   // GfxShaderRes.type
 
 static double now_ms_qpc(void) {
-    static double inv;
-    LARGE_INTEGER t;
-    if (!inv) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        inv = 1000.0 / (double)f.QuadPart;
-    }
-    QueryPerformanceCounter(&t);
-    return (double)t.QuadPart * inv;
+    return (double)plat_now_ns() / 1e6;
 }
 
 static struct { VkWriteDescriptorSet w[POOL_FLUSH]; VkDescriptorImageInfo ii[POOL_FLUSH]; uint32_t n; } PW;
@@ -3240,15 +3232,15 @@ static void op_dispatch_steps(VkExec *ex, const p_dispatch *d) {
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
     if (!cs) {   // which kernels a frame loses, once per program: the size and the game's call site tell them apart
-        static SRWLOCK lock = SRWLOCK_INIT;
+        static PlatMutex lock = PLAT_MUTEX_INIT;
         static uint64_t seen[128];
         static int nseen;
         int fresh = 1;
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         for (int i = 0; i < nseen && fresh; i++) fresh = seen[i] != ex->prog->serial;
         if (fresh && nseen < 128) seen[nseen++] = ex->prog->serial;
         else fresh = 0;
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         if (fresh)
             rt_log("vk: dispatch %dx%dx%d of program %llu from %#llx skipped: its shader did not translate", d->x, d->y,
                    d->z, (unsigned long long)ex->prog->serial, (unsigned long long)d->caller);
@@ -3393,11 +3385,11 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
 // {x, y, z} group counts at its address (its 16-byte stride is the game's; a frame dump note shows its words as the
 // CPU sees them). Counted, logged at powers of two from 256; OOT_MESH=0 skips them all (diagnostic).
 static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
-    static volatile LONG direct, indirect, drawn;
+    static int32_t direct, indirect, drawn;
     static int mesh_on = -1;
     static PFN_vkCmdDrawMeshTasksEXT draw_fn;
     static PFN_vkCmdDrawMeshTasksIndirectEXT draw_ind_fn;
-    LONG k = InterlockedIncrement(d->ind ? &indirect : &direct);
+    int32_t k = __atomic_add_fetch(d->ind ? &indirect : &direct, 1, __ATOMIC_SEQ_CST);
     if (k >= 256 && !(k & (k - 1)))
         rt_log("vk_exec: %ld %s mesh-task draws met, %ld drawn", (long)k, d->ind ? "indirect" : "direct", (long)drawn);
     if (mesh_on < 0) {
@@ -3476,7 +3468,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
         rec_mesh_tasks(draw_fn, ex->cb, d->count, 1, 1);
     }
     ex->recorded++;
-    InterlockedIncrement(&drawn);
+    __atomic_add_fetch(&drawn, 1, __ATOMIC_SEQ_CST);
     vk_exec_frame.draws++;
 }
 

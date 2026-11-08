@@ -824,8 +824,8 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
         }
         if (b >= 0) r->pool = (uint8_t)(b + 1), r->count = 1;
         else {
-            static volatile LONG said;
-            if (InterlockedIncrement(&said) <= 4)
+            static int32_t said;
+            if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 4)
                 rt_log("gfx_shader: a pool-indexed %s of type %#x is not supported: it reads the placeholder",
                        kind == GFX_RES_IMG ? "image" : "texture", r->type);
         }
@@ -900,12 +900,12 @@ static void add_pool_feedback(GfxShader *s, const uint32_t *vars, int nv) {
     free(s->spirv);
     s->spirv = o, s->words = (uint64_t)(q - o);
     // OOT_POOL_SPV_DUMP=1 (diagnostic): the first 8 patched modules go to <cache>\pool-fb-<n>.spv, for spirv-val
-    static volatile LONG dumped;
+    static int32_t dumped;
     const char *dump = cfg_get("OOT_POOL_SPV_DUMP");
     if (dump && *dump == '1' && cache_dir[0]) {
-        LONG k = InterlockedIncrement(&dumped);
+        int32_t k = __atomic_add_fetch(&dumped, 1, __ATOMIC_SEQ_CST);
         char path[PATH_CAP + 32];
-        snprintf(path, sizeof path, "%s\\pool-fb-%ld.spv", cache_dir, k);
+        snprintf(path, sizeof path, "%s/pool-fb-%d.spv", cache_dir, (int)k);
         if (k <= 8) write_file(path, s->spirv, s->words * 4);
     }
 }
@@ -1477,8 +1477,8 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
         memcpy(buf, r->key, 32);
         rt_sha256((const uint8_t *)spec, strlen(spec), buf + 32);
         rt_sha256(buf, sizeof buf, r->key);
-        static volatile LONG logged;
-        if (InterlockedIncrement(&logged) <= 4) rt_log("gfx_shader: OOT_PROBE %s: program found (%u bytes)", spec, r->length);
+        static int32_t logged;
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 4) rt_log("gfx_shader: OOT_PROBE %s: program found (%u bytes)", spec, r->length);
     }
     return 1;
 }
@@ -1495,13 +1495,13 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
 // (2026-11-07: three kernels of the level failed some 30 times a frame, a tenth of a second of the render thread). The
 // background path keeps its failures in X.waits instead.
 typedef struct Failed { struct Failed *next; uint8_t key[32]; } Failed;
-static struct { SRWLOCK lock; Failed *head[256]; } FAILED = {SRWLOCK_INIT};
+static struct { PlatMutex lock; Failed *head[256]; } FAILED = {PLAT_MUTEX_INIT};
 
 static int failed_known(const uint8_t key[32]) {
-    AcquireSRWLockShared(&FAILED.lock);
+    plat_mutex_lock(&FAILED.lock);
     const Failed *f = FAILED.head[key[0]];
     while (f && memcmp(f->key, key, 32)) f = f->next;
-    ReleaseSRWLockShared(&FAILED.lock);
+    plat_mutex_unlock(&FAILED.lock);
     return f != NULL;
 }
 
@@ -1509,9 +1509,9 @@ static void failed_note(const uint8_t key[32]) {
     Failed *f = calloc(1, sizeof *f);
     if (!f) return;
     memcpy(f->key, key, 32);
-    AcquireSRWLockExclusive(&FAILED.lock);
+    plat_mutex_lock(&FAILED.lock);
     f->next = FAILED.head[key[0]], FAILED.head[key[0]] = f;
-    ReleaseSRWLockExclusive(&FAILED.lock);
+    plat_mutex_unlock(&FAILED.lock);
 }
 
 static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
@@ -1670,9 +1670,9 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         // The translator refused it: the lowered program and the request stay, as <key>.xfail.code and .xfail.json,
         // so it can be translated again by hand (oot_xlate <jobs file> <dir>, with the code path pointed there).
         char keep[PATH_CAP + 80], msg[LINE_MAX_LEN + 64];
-        snprintf(keep, sizeof keep, "%s\\%s.xfail.json", cache_dir, hex), write_file(keep, req, strlen(req));
-        snprintf(keep, sizeof keep, "%s\\%s.xfail.code", cache_dir, hex);
-        if (!MoveFileExA(code_path, keep, MOVEFILE_REPLACE_EXISTING)) plat_file_delete(code_path);
+        snprintf(keep, sizeof keep, "%s/%s.xfail.json", cache_dir, hex), write_file(keep, req, strlen(req));
+        snprintf(keep, sizeof keep, "%s/%s.xfail.code", cache_dir, hex);
+        if (!plat_file_replace(code_path, keep)) plat_file_delete(code_path);
         free(req);
         plat_file_delete(spv_path), plat_file_delete(res_path);
         snprintf(msg, sizeof msg, "%s stage: %s", r->stage_name, reply);

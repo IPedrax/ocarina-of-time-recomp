@@ -1227,10 +1227,9 @@ void vk_dump_init(void) {
     const char *d = cfg_get("OOT_DUMP_DIR");
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);
     else {
-        char exe[MAX_PATH];
-        DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-        char *slash = n ? strrchr(exe, '\\') : NULL;
-        if (slash) *slash = 0, snprintf(dir, sizeof dir, "%s\\dump", exe);
+        char exe[1024];
+        char *slash = plat_exe_path(exe, sizeof exe) ? strrchr(exe, '/') : NULL;
+        if (slash) *slash = 0, snprintf(dir, sizeof dir, "%s/dump", exe);
         else snprintf(dir, sizeof dir, "dump");
     }
     make_dirs(dir);

@@ -11,10 +11,11 @@
 // PACIB lifts as an identity), x0 = the value (1 for 0), the thread's host depth as it was at the setjmp, and
 // longjmps the host there. The lifted frames in between are plain C frames, and the non-SEH longjmp (cpu.h)
 // unwinds none of them. A longjmp whose jmp_buf no RT_SETJMP recorded runs the guest's own, as before.
-#include <windows.h>
+#include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "platform/platform.h"
 #include "cpu.h"
 #include "host.h"
 
@@ -26,21 +27,21 @@ typedef struct {
     jmp_buf host;
 } SjRec;
 static SjRec sj[SJ_N];
-static SRWLOCK sj_lock = SRWLOCK_INIT;
+static PlatMutex sj_lock = PLAT_MUTEX_INIT;
 static unsigned sj_next;
-static volatile LONG sj_jumps, sj_misses;
+static int32_t sj_jumps, sj_misses;
 
 jmp_buf *rt_sj_enter(Cpu *c) {
     uint64_t buf = c->x[0];
     SjRec *e = NULL;
-    AcquireSRWLockExclusive(&sj_lock);
+    plat_mutex_lock(&sj_lock);
     for (int i = 0; i < SJ_N && !e; i++)   // the same jmp_buf again (Lua reuses its frame's): the newest setjmp wins
         if (sj[i].buf == buf && sj[i].thread == c->thread) e = &sj[i];
     for (int i = 0; i < SJ_N && !e; i++)
         if (!sj[i].buf) e = &sj[i];
     if (!e) e = &sj[sj_next++ % SJ_N];     // full: the oldest slot (a stale record, as the frames are nested)
     e->buf = buf, e->thread = c->thread, e->depth = c->thread ? *kern_host_depth(c->thread) : 0;
-    ReleaseSRWLockExclusive(&sj_lock);
+    plat_mutex_unlock(&sj_lock);
     return &e->host;
 }
 
@@ -48,12 +49,12 @@ static void ov_longjmp(Cpu *c) {
     uint64_t buf = c->x[0];
     uint32_t val = (uint32_t)c->x[1];
     SjRec *e = NULL;
-    AcquireSRWLockShared(&sj_lock);
+    plat_mutex_lock(&sj_lock);
     for (int i = 0; i < SJ_N && !e; i++)
         if (sj[i].buf == buf && sj[i].thread == c->thread) e = &sj[i];
-    ReleaseSRWLockShared(&sj_lock);
+    plat_mutex_unlock(&sj_lock);
     if (!e) {
-        if (InterlockedIncrement(&sj_misses) <= 4)
+        if (__atomic_add_fetch(&sj_misses, 1, __ATOMIC_SEQ_CST) <= 4)
             rt_log("sjlj: longjmp to %#llx, which no RT_SETJMP recorded: the guest's own longjmp", (unsigned long long)buf);
         rt_original(c);
         return;
@@ -65,7 +66,7 @@ static void ov_longjmp(Cpu *c) {
     for (int d = 8; d <= 15; d++) c->v[d] = jb[14 + (d - 8)];   // D registers: the upper halves read as zero
     c->x[0] = val ? val : 1;
     if (c->thread) __atomic_store_n(kern_host_depth(c->thread), e->depth, __ATOMIC_RELAXED);
-    if (InterlockedIncrement(&sj_jumps) <= 8)
+    if (__atomic_add_fetch(&sj_jumps, 1, __ATOMIC_SEQ_CST) <= 8)
         rt_log("sjlj: longjmp to %#llx with %u: back to its setjmp (x30 %#llx, sp %#llx)", (unsigned long long)buf, val,
                (unsigned long long)c->x[30], (unsigned long long)c->sp);
     longjmp(e->host, 1);

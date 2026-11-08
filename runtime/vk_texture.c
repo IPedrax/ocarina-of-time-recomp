@@ -677,12 +677,12 @@ static void tex_raw_dump(const nvn_texdesc *d, const uint8_t *blocks, size_t siz
 static int storage_readable(const void *p, size_t n) {
     VkMemSpan sp;
     if (vk_mem_resolve((uint64_t)(uintptr_t)p, n, &sp) && sp.pool) return 1;
-    const uint8_t *a = p, *end = a + n;
+    uint64_t a = (uint64_t)(uintptr_t)p, end = a + n;
     while (a < end) {
-        MEMORY_BASIC_INFORMATION mi;
-        if (!VirtualQuery(a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-            return 0;
-        a = (const uint8_t *)mi.BaseAddress + mi.RegionSize;
+        uint64_t run;
+        int st = plat_mem_state(a, end, &run);
+        if (st != PLAT_PROT_READ && st != PLAT_PROT_RW) return 0;
+        a = run;
     }
     return 1;
 }

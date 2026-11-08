@@ -3054,16 +3054,15 @@ typedef struct MeshJob {
 } MeshJob;
 static MeshJob *mesh_jobs;   // being built; under P.lock
 
-static void CALLBACK mesh_build(PTP_CALLBACK_INSTANCE inst, void *arg) {
-    (void)inst;
+static void mesh_build(void *arg) {
     MeshJob *j = arg;
     VkPipeline pipe = mesh_create(&j->s, &j->key.k, j->sh, j->off, j->l);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     if (!pipe) P.stats.failures++, rt_log("vk_pipeline: mesh pipeline not built: pipeline creation failed");
     pipe_add(&j->key, sizeof j->key, j->h, pipe, j->l, &j->B, VK_PIPELINE_BIND_POINT_GRAPHICS, 0);
     for (MeshJob **q = &mesh_jobs; *q; q = &(*q)->next)
         if (*q == j) { *q = j->next; break; }
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     if (pipe) rt_log("vk_pipeline: a mesh pipeline built in the background (%s mesh + fragment, %u bindings)",
                      j->sh[0] ? "task +" : "", j->B.n);
     free(j);
@@ -3083,13 +3082,13 @@ VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const Gfx
     memset(key.k.attr_fmt, 0, sizeof key.k.attr_fmt), memset(key.k.attr_off, 0, sizeof key.k.attr_off);
     memset(key.k.attr_bind, 0, sizeof key.k.attr_bind), memset(key.k.rate, 0, sizeof key.k.rate);
     uint64_t h = key_hash(&key, sizeof key);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     Pipe *p = pipe_find(&key, sizeof key, h);
     MeshJob *pending = NULL;
     if (!p)
         for (pending = mesh_jobs; pending && (pending->h != h || memcmp(&pending->key, &key, sizeof key)); pending = pending->next) {}
     if (pending) {
-        ReleaseSRWLockExclusive(&P.lock);
+        plat_mutex_unlock(&P.lock);
         return VK_NULL_HANDLE;   // its job is building it: this draw is skipped
     }
     if (p) {
@@ -3113,11 +3112,11 @@ VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const Gfx
                 j->h = h, j->key = key, j->s = *s, j->l = l, j->B = B;
                 memcpy(j->sh, sh, sizeof sh), memcpy(j->off, off, sizeof off);
                 j->next = mesh_jobs, mesh_jobs = j;
-                if (TrySubmitThreadpoolCallback(mesh_build, j, NULL)) {
-                    ReleaseSRWLockExclusive(&P.lock);
+                if (plat_thread_spawn(mesh_build, j, "mesh pipeline", 0)) {
+                    plat_mutex_unlock(&P.lock);
                     return VK_NULL_HANDLE;
                 }
-                mesh_jobs = j->next, free(j);   // no thread pool: built inline below
+                mesh_jobs = j->next, free(j);   // no thread: built inline below
             }
         }
         VkPipeline pipe = why ? VK_NULL_HANDLE : mesh_create(s, &key.k, sh, off, l);
@@ -3129,7 +3128,7 @@ VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const Gfx
         p = pipe_add(&key, sizeof key, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, 0);
         if (pipe) rt_log("vk_pipeline: a mesh pipeline built (%s mesh + fragment, %u bindings)", ts ? "task +" : "", B.n);
     }
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     if (!p) return VK_NULL_HANDLE;
     if (info) *info = &p->info;
     return p->info.pipeline;

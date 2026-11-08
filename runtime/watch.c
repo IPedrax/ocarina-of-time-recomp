@@ -19,6 +19,9 @@
 // The debug registers are per thread and survive fiber switches, so a helper thread arms every thread of the
 // process (suspend, set DR0-3 and DR7, resume) and checks for new ones every 200 ms. The trap comes after the write,
 // as EXCEPTION_SINGLE_STEP with the address's bit set in DR6; the handler logs, clears DR6 and continues.
+#ifndef _WIN32
+void watch_start(void) {}   // shortcut: hardware watchpoints are Win32 debug registers, a no-op here; port with perf_event_open when a Linux hunt needs them
+#else
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdint.h>
@@ -190,3 +193,4 @@ void watch_start(void) {
     if (t) CloseHandle(t);
     rt_log("watch: OOT_WATCH_WRITE on %d address(es), from frame %llu", W.n, (unsigned long long)W.from);
 }
+#endif
