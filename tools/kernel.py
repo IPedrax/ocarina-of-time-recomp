@@ -18,6 +18,7 @@ The sm86_lower tool is built into build/tools/ with gcc when its sources are new
 import argparse
 import collections
 import json
+import shutil
 import struct
 import subprocess
 import sys
@@ -28,7 +29,7 @@ CACHE = ROOT / "build" / "v131072" / "shader-cache"
 WINDOWS = sys.platform == "win32"   # native Windows (toolchain/msys64) rather than WSL
 TOOL = ROOT / "build" / "tools" / ("sm86_lower.exe" if WINDOWS else "sm86_lower")
 MSYS_BIN = ROOT / "toolchain" / "msys64" / "ucrt64" / "bin"
-XLATE = ROOT / "build" / "xlate" / "oot_xlate.exe"
+XLATE = ROOT / "build" / "xlate" / ("oot_xlate.exe" if WINDOWS or shutil.which("wslpath") else "oot_xlate")
 VKSDK = Path("/mnt/c/VulkanSDK")
 NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFMA", 0x231: "HFMA2", 0x235: "HADD2",
          0x981: "LDG", 0x986: "STG", 0x984: "LDS", 0x388: "STS", 0x918: "NOP", 0x824: "IMAD", 0x810: "IADD3",
@@ -37,7 +38,7 @@ NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFM
 
 
 def wpath(p: Path) -> str:
-    if WINDOWS:
+    if WINDOWS or not shutil.which("wslpath"):   # native Windows or native Linux
         return str(p)
     return subprocess.check_output(["wslpath", "-w", str(p)], text=True).strip()
 
@@ -115,6 +116,8 @@ def lower(k: dict, out: Path, tensor: bool) -> tuple[Path, Path]:
 def spirv_tools() -> tuple[Path | None, Path | None]:
     if WINDOWS and (MSYS_BIN / "spirv-val.exe").exists():
         return MSYS_BIN / "spirv-val.exe", MSYS_BIN / "spirv-dis.exe"
+    if shutil.which("spirv-val") and shutil.which("spirv-dis"):   # native Linux: the system's SPIRV-Tools
+        return Path(shutil.which("spirv-val")), Path(shutil.which("spirv-dis"))
     bins = sorted(VKSDK.glob("*/Bin"))
     if not bins:
         return None, None
