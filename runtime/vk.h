@@ -218,6 +218,9 @@ const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
 void vk_headroom_start(void);
 void vk_headroom_stop(void);   // before vmaDestroyAllocator
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// The pointer table (vk_memory.c, docs/pointers.md): the storage buffer shaders read to turn a GPU address into a
+// device address. 0 when it is off.
+int vk_mem_ptr_table(VkBuffer *buf, VkDeviceSize *size);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);
