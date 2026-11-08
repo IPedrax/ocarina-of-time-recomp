@@ -201,3 +201,6 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   access for the accesses GlobalToStorage cannot place, instead of dropping them: VK_KHR_buffer_device_address
   (PhysicalStorageBuffer pointers in SPIR-V) and a translation from guest GPU addresses to host device addresses
   (each guest pool is a Vulkan buffer), e.g. a page table the shader reads. A design note before code.
+- 2026-11-08: the design for that is `docs/pointers.md` (an address table from GPU addresses to Vulkan device
+  addresses, the translator's fallback through it, first under `OOT_MEMORY=import`, mirrors second); its plan P1-P6
+  comes before E1 here.
