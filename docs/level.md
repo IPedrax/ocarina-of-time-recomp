@@ -147,3 +147,22 @@ After each change that alters what a shader computes: the `verify-shader-change`
   Level route: 0 InvalidOperation failures (19 lowering refusals left), ~54-59 fps; the picture still has the white
   areas and the spikes (`build/logs/item1-level.png`, a different moment of the route), the title is unchanged
   (noise 0.54), and the chain's indirect records still read 0 from frame 4000 (`OOT_MESH_IND_LOG=4000`). Next: item 2.
+- 2026-11-08, later: what the white is and where the culling counts go.
+  - The white is mostly missing geometry: the end-of-frame chain (pass 161 scene, 162 histogram `745220f3`, 163
+    `3ce2b98c`, 164 the TAAU upscaler `406ecfce`, 165 the tone map to the screen) already has the white shapes in
+    pass 163's input; the upscaler multiplies those values about 160-fold (max 16,896). Running `3f15911a` or
+    everything (`OOT_SKIP_CS=none`) does not change it. #13 (occlusion reports kept per address) brought much of the
+    missing geometry back.
+  - The culling chain's indirect records are written by the game's CPU code each frame (`main+0x2bfd340`, called
+    from `main+0x566fd0`, found with `OOT_WATCH_WRITE`), after it reads pass 0's output (`0x29bb9c000`, by
+    `main+0x2bfd750`); nothing on the GPU writes them by binding, and no copy or clear does. `OOT_WATCH_POLL` in
+    `OOT_MEMORY=import` saw pass 0's output and the records never change over 3,500 frames.
+  - Pass 0 (`e6d5432f`, 1,952 instructions, no textures) counts with six RED (ADD and MAX, U32) through pointers it
+    loads from its bank 4 (uniform slot 1, `LDC c[4][Rn]`): a table of pointers to the records themselves. None was
+    bound, so 0022's search dropped every count; 93dd87b binds what uniform buffers point at too. The records still
+    read 0 with it, in both memory modes, so either the RED addresses fall outside the bound spans or the kernel does
+    not reach them (its own stores to 0x29bb9c000 never land either). Its P2R, compares and selects are next; the
+    probe (`OOT_PROBE`) writes images only, and this kernel writes buffers.
+  - The game embeds Lua; its error longjmp crashed us at `main+0x1661690` (d105aa9 fixes it, runtime/sjlj.c).
+  - New dump (`files/`, base + update packages, 186,583 RomFS files as other players have) in use since this
+    evening; code identical, 9 RomFS files differ from the old one, none in Kokiri Forest.
