@@ -133,3 +133,17 @@ After each change that alters what a shader computes: the `verify-shader-change`
 ## Status
 
 - 2026-11-08: written; next is item 1 of the plan.
+- 2026-11-08: item 1, as it turned out. No program of the game reads bank 0 at 0x880 or above (a scan of the
+  14,363 census programs: the highest offsets are the task and mesh tables at 0x670 and 0x770): Hookshot's table there
+  is its own, an area its fallback searches. Ours is #12's: 0022 searches the stage's storage table, ptr_targets_add
+  fills its free slots. What was missing, now done:
+  - translator patch 0024: 32 storage-buffer slots instead of 16 (0022's sixteen table targets crowded out the
+    shader's own buffers: "Failed to reserve storage buffer", 624 dropped loads and 12 atomics in 33 compute programs,
+    72 loads and 12 atomics in 9 mesh programs, 6 loads in 3 task programs; and the 45 "Invalid storage kind
+    GlobalMemory" failures, all 86 refused jobs kept so far now translate and pass spirv-val), and the task and mesh
+    tables (0x670, 0x770) for 0022's search, where those stages searched compute's 0x310;
+  - `op_draw_mesh_ptr`: pointer targets bound for the task, mesh and fragment stages of mesh draws (run 463 logs them,
+    e.g. a 64 MiB target for mesh storage slot 1).
+  Level route: 0 InvalidOperation failures (19 lowering refusals left), ~54-59 fps; the picture still has the white
+  areas and the spikes (`build/logs/item1-level.png`, a different moment of the route), the title is unchanged
+  (noise 0.54), and the chain's indirect records still read 0 from frame 4000 (`OOT_MESH_IND_LOG=4000`). Next: item 2.
