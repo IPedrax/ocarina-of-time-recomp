@@ -42,19 +42,30 @@ content check (`tools/check_content.py`, run by the pre-commit hook and CI) keep
 
 ## Building
 
-The game is not playable yet (see Status); these steps build what there is. Commands are shown for Windows; from WSL
-the same scripts run (the build itself still uses Windows Python and MSYS2 through interop).
+The game runs into the first area with rendering faults (see Status). Commands are shown for Windows; from WSL the same
+scripts run (the build itself still uses Windows Python and MSYS2 through interop).
 
 Needs:
 
 - Python 3.14 or later for the extraction (its standard library reads zstd), and a Python 3.12 or later venv with
   `tools/requirements.txt` for the generator and the build.
-- MSYS2 with the UCRT64 toolchain: gcc (for `tools/build_zbic.py`), clang, lld and ninja, and the libraries the game
-  links (SDL3, Vulkan headers and loader, Vulkan Memory Allocator, opus, libvpx, dav1d). The tools look for it in
-  `OOT_MSYS2`, then `toolchain/msys64` in the repository, then `C:\msys64`.
+- MSYS2 with the UCRT64 toolchain and the libraries the runtime builds against. The tools look for it in
+  `OOT_MSYS2`, then `toolchain/msys64` in the repository, then `C:\msys64`. In the MSYS2 UCRT64 shell:
+
+  ```
+  pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld \
+      mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-vulkan-headers \
+      mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-vulkan-memory-allocator mingw-w64-ucrt-x86_64-opus \
+      mingw-w64-ucrt-x86_64-libvpx mingw-w64-ucrt-x86_64-dav1d mingw-w64-ucrt-x86_64-openh264 \
+      mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-spirv-tools
+  ```
+
+  (gcc for `tools/build_zbic.py`; openh264 because the movie code includes its headers and the build copies its DLL;
+  shaderc and spirv-tools for `tools/build_shaders.py` and checking translated shaders.)
 - The .NET 10 SDK and the MSVC build tools for the shader translator.
 - A Vulkan GPU; the title screen's upscaler is fastest with `VK_KHR_cooperative_matrix` (recent NVIDIA, AMD or Intel).
 - About 30 GB free for the extracted RomFS, besides the dump.
+- Memory: the game commits about 21 GB on the level, so Windows needs that much free commit (RAM plus page file).
 
 Steps:
 
