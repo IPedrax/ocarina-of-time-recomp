@@ -606,6 +606,114 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 
+// OOT_PASS_TIME=1 (diagnostic): the GPU time of every render pass, from timestamps around it (outside the pass), summed per
+// kind (target size, colour format of the first target, colour target count, depth) and logged every PST_REPORT passes,
+// the costliest first, with the draws it held and the cost per frame. For finding where the graphics time of a frame goes
+// (the level: 25 ms of GPU time a frame, 10 of them compute, 2026-11-08). The timestamps wait for earlier work, so the
+// total runs a little over an untimed frame.
+enum { PST_PAIRS = 1024, PST_KINDS = 48, PST_REPORT = 900 };
+typedef struct { uint32_t w, h, nc, fmt, depth; uint64_t n, draws; double ns; } PstKind;
+typedef struct { uint32_t pair, w, h, nc, fmt, depth; uint64_t draws, frame; } PstRead;
+static VkQueryPool pst_pool;
+static uint32_t pst_next;
+static volatile int32_t pst_busy[PST_PAIRS];
+static PstKind pst_kind[PST_KINDS];
+static int pst_nk, pst_reads;
+static uint64_t pst_frame_lo, pst_frame_hi;
+static PlatMutex pst_lock = PLAT_MUTEX_INIT;
+static int pst_cur = -1;                 // the open pass's pair, -1 untimed (passes do not nest, one replay thread)
+static uint64_t pst_draws0;
+
+static int pst_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_PASS_TIME");
+        on = e && atoi(e) ? 1 : 0;
+        if (on) {
+            VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                        .queryCount = 2 * PST_PAIRS};
+            if (vkCreateQueryPool(vk_ctx()->device, &qi, NULL, &pst_pool) != VK_SUCCESS) on = 0;
+            rt_log("vk_exec: OOT_PASS_TIME: %s", on ? "render passes timed on the GPU" : "no query pool, not timed");
+        }
+    }
+    return on;
+}
+
+static int pst_cmp(const void *a, const void *b) {
+    double x = ((const PstKind *)a)->ns, y = ((const PstKind *)b)->ns;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void pst_read(void *arg) {   // completion thread
+    PstRead *r = arg;
+    uint64_t v[2];
+    static double period;
+    if (!period) {
+        VkPhysicalDeviceProperties pr;
+        vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pr);
+        period = pr.limits.timestampPeriod;
+    }
+    int ok = vkGetQueryPoolResults(vk_ctx()->device, pst_pool, 2 * r->pair, 2, sizeof v, v, sizeof v[0],
+                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && v[1] >= v[0];
+    __atomic_exchange_n(&pst_busy[r->pair], 0, __ATOMIC_SEQ_CST);
+    if (!ok) { free(r); return; }
+    plat_mutex_lock(&pst_lock);
+    int i = 0;
+    while (i < pst_nk && !(pst_kind[i].w == r->w && pst_kind[i].h == r->h && pst_kind[i].nc == r->nc &&
+                           pst_kind[i].fmt == r->fmt && pst_kind[i].depth == r->depth)) i++;
+    if (i == pst_nk && pst_nk < PST_KINDS)
+        pst_kind[pst_nk] = (PstKind){.w = r->w, .h = r->h, .nc = r->nc, .fmt = r->fmt, .depth = r->depth}, pst_nk++;
+    if (i < pst_nk) pst_kind[i].n++, pst_kind[i].draws += r->draws, pst_kind[i].ns += (double)(v[1] - v[0]) * period;
+    if (!pst_reads || r->frame < pst_frame_lo) pst_frame_lo = r->frame;
+    if (r->frame > pst_frame_hi) pst_frame_hi = r->frame;
+    if (++pst_reads >= PST_REPORT) {
+        qsort(pst_kind, (size_t)pst_nk, sizeof *pst_kind, pst_cmp);
+        double all = 0;
+        for (int k = 0; k < pst_nk; k++) all += pst_kind[k].ns;
+        uint64_t frames = pst_frame_hi - pst_frame_lo + 1;
+        rt_log("vk_exec: OOT_PASS_TIME: %d passes over %llu frames (%llu-%llu), %.1f ms of GPU time in %d kinds, %.2f ms a frame:",
+               pst_reads, (unsigned long long)frames, (unsigned long long)pst_frame_lo, (unsigned long long)pst_frame_hi,
+               all / 1e6, pst_nk, all / 1e6 / (double)frames);
+        for (int k = 0; k < pst_nk && k < 14; k++) {
+            const PstKind *c = &pst_kind[k];
+            rt_log("vk_exec:   %ux%u, %u colour, depth %u, format %u: x%llu, %.3f ms each, %.2f ms a frame, %.1f%%, %.1f draws each",
+                   c->w, c->h, c->nc, c->depth, c->fmt, (unsigned long long)c->n, c->ns / (double)c->n / 1e6,
+                   c->ns / 1e6 / (double)frames, 100.0 * c->ns / all, (double)c->draws / (double)c->n);
+        }
+        memset(pst_kind, 0, sizeof pst_kind);
+        pst_nk = 0, pst_reads = 0;
+    }
+    plat_mutex_unlock(&pst_lock);
+    free(r);
+}
+
+// Before the pass begins (outside it): reset the pair and write the first timestamp.
+static void pst_begin(VkExec *ex) {
+    pst_cur = -1;
+    if (!pst_on()) return;
+    uint32_t p = pst_next++ % PST_PAIRS;
+    int32_t was = 0;
+    __atomic_compare_exchange_n(&pst_busy[p], &was, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (was) return;
+    vkCmdResetQueryPool(ex->cb, pst_pool, 2 * p, 2);
+    vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pst_pool, 2 * p);
+    pst_cur = (int)p;
+    pst_draws0 = vk_exec_frame.draws;
+}
+
+// After the pass ended: the second timestamp, and the read once the submission is done.
+static void pst_end(VkExec *ex) {
+    if (pst_cur < 0) return;
+    vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pst_pool, 2 * (uint32_t)pst_cur + 1);
+    PstRead *r = malloc(sizeof *r);
+    if (!r) rt_fatal("vk_exec: out of memory");
+    r->pair = (uint32_t)pst_cur, r->w = ex->pass_w, r->h = ex->pass_h, r->nc = ex->pass_ncolor,
+    r->fmt = ex->color[0].img ? (uint32_t)ex->color[0].img->format : 0, r->depth = ex->pass_depth != 0,
+    r->draws = vk_exec_frame.draws - pst_draws0, r->frame = gfx_counters.frames;
+    vk_completion_add(ex->fence, pst_read, r);
+    pst_cur = -1;
+}
+
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     resolve_rt(ex);
@@ -654,6 +762,7 @@ void vk_exec_pass_begin(VkExec *ex) {
                  ex->pass_ncolor, ex->pass_depth != 0, (unsigned long long)vk_sync_issued() + 1, (unsigned long long)gfx_counters.frames);
         vk_crumb_op(ex->cb, desc);
     }
+    pst_begin(ex);
     vkCmdBeginRendering(ex->cb, &ri);
     vk_exec_frame.passes++;
     ex->recorded++;
@@ -665,6 +774,7 @@ void vk_exec_pass_end(VkExec *ex) {
     vk_exec_oq_pass_end(ex);
     vk_exec_xfb_pass_end(ex, 0);
     vkCmdEndRendering(ex->cb);
+    pst_end(ex);
     ex->recorded++;
     ex->in_pass = 0;
     vk_exec_xfb_pass_end(ex, 1);
