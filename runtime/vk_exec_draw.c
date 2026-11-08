@@ -3111,9 +3111,19 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
 // OOT_SKIP_CS=all|<hex>[,<hex>...]|!<hex>[,...] (diagnostic): compute dispatches of every shader, of those whose input
 // id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU timeout (2026-11-06: the
 // Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
+// Without OOT_SKIP_CS, SKIP_CS_DEFAULT: kernels that translate but are known to write wrong values, left out until
+// they are fixed, as they were while they did not translate (OOT_SKIP_CS=none runs them):
+// - ace1cec0 (the level's background, 64x64 groups): black and white blocks over the whole picture (2026-11-08, with
+//   main's uniform-buffer table; before it, a device loss);
+// - 3f15911a (an indirect dispatch between the end-of-frame histogram 745220f3 and 3ce2b98c, bit masks written with
+//   SURED.OR): blown-out white patches that flicker with the camera's distance, from the merge that made its LEA
+//   with a negated addend lower (2026-11-08: build/logs/dump-197 is clean up to the fog composite, pass 0128; skipped,
+//   the picture is too, build/logs/skip-3f15.png).
+#define SKIP_CS_DEFAULT "ace1cec0,3f15911a"
 static int skip_cs(const GfxShader *cs) {
     const char *e = getenv("OOT_SKIP_CS");
-    if (!e || !*e) return 0;
+    if (!e) e = SKIP_CS_DEFAULT;
+    if (!*e || !strcmp(e, "none")) return 0;
     char hex[17];
     const uint8_t *id = gfx_shader_input_id(cs);
     for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
