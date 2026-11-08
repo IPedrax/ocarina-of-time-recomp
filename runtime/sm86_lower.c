@@ -2103,20 +2103,27 @@ static void h2_relu(L *l, uint32_t rd) {
     emit(l, l->pred | HMUL2_R(rd, rd, m));
 }
 
-// HMNMX2 (0x040, Ampere): min (predicate 87-90 true) or max of two half pairs; register form, plain operands.
+// HMNMX2 (0x040, Ampere): min (predicate 87-90 true) or max of two half pairs; register form. |a| (73) and |b| (62),
+// placed as FADD's on Turing: the end-of-frame upscaler 430bf485 takes max(|R.H0_H0|, |R.H1_H1|) (2026-11-06).
+// Maxwell's HSET2 and HFMA2 lack an absolute value on every operand, so each one first goes through HADD2 |x| + 0
+// (.ABS_A 44), which also applies the swizzle; the negations (63, 72) stay unsupported.
 static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), b = bits(x, 32, 8), a_swz = bits(x, 74, 2), b_swz = bits(x, 60, 2);
-    int is_min = bits(x, 87, 3) == 7 ? !bits(x, 90, 1) : -1;
-    // Negated operands (a: bit 73, b: bit 62; the upscaler's 0a9afab0 takes max(-x, -y), 2026-11-06) become a
-    // subtraction from zero into scratch first, swizzle applied, so the sequence below sees plain pairs. Absolute
-    // values (72, 63) are not lowered.
+    int is_min = bits(x, 87, 3) == 7 ? !bits(x, 90, 1) : -1, a_abs = bits(x, 73, 1), b_abs = bits(x, 62, 1);
     if (op != 0x240 || is_min < 0 || bits(x, 63, 1) || bits(x, 72, 1) || bits(x, 76, 11)) {
         char why[96];   // the words, so a new form can be read off the log without the program at hand
         snprintf(why, sizeof why, "HMNMX2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
         return (void)fail(l, why);
     }
-    if (bits(x, 73, 1)) emit(l, l->pred | HADD2_SUB_R(S(l, 3), RZ, 0, a, a_swz)), a = S(l, 3), a_swz = 0;
-    if (bits(x, 62, 1)) emit(l, l->pred | HADD2_SUB_R(S(l, 4), RZ, 0, b, b_swz)), b = S(l, 4), b_swz = 0;
+    if (a_abs || b_abs) {   // |x.swz| + 0 into scratch, read back unswizzled (H1_H0 = 0)
+        uint32_t ta = a_abs ? S(l, 3) : a, tb = b_abs ? S(l, 4) : b;
+        if (a_abs) emit(l, l->pred | 0x5d10000000000000ull | ta | ((uint64_t)a << 8) | ((uint64_t)RZ << 20) |
+                               ((uint64_t)1 << 44) | ((uint64_t)a_swz << 47));
+        if (b_abs) emit(l, l->pred | 0x5d10000000000000ull | tb | ((uint64_t)b << 8) | ((uint64_t)RZ << 20) |
+                               ((uint64_t)1 << 44) | ((uint64_t)b_swz << 47));
+        if (a_abs) a = ta, a_swz = 0;
+        if (b_abs) b = tb, b_swz = 0;
+    }
     uint32_t m = S(l, 1), d = S(l, 2);
     emit(l, l->pred | (is_min ? HSET2_GT_BF(m, b, b_swz, a, a_swz) : HSET2_GT_BF(m, a, a_swz, b, b_swz)));
     emit(l, l->pred | HADD2_SUB_R(d, a, a_swz, b, b_swz));
