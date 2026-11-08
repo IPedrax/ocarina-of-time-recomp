@@ -382,8 +382,10 @@ NVN_API(nvnMemoryPoolMap) {
 // CPU-written texture (vk_texture.c tex_mirrored). The copy is made at the mapping; pages the game rewrites
 // afterwards without mapping them again are not seen. A mapping from a PHYSICAL pool (TotK's kind, CPU-invisible)
 // has no bytes to copy and is not supported with shadow storage.
+// A CPU-visible physical pool (OoT 1.1.1: flags 0x18c, 305 MiB mapped whole into one virtual pool) keeps the game's
+// storage (pool_place), so it is a source like any CPU pool; only the CPU-invisible kind has no bytes to copy.
 static int shadow_source(const pool_t *p) {
-    return !(p->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) &&
+    return !(p->flags & (NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) &&
            p->mem && !nvn_gpu_only((uintptr_t)p->mem);
 }
 static void shadow_map(pool_t *v, const nvn_mapping_t *r) {
@@ -453,9 +455,11 @@ NVN_API(nvnMemoryPoolMapVirtual) {
         const pool_t *src = (const pool_t *)(const void *)r[i].physical_pool;
         if (!src || shadow_source(src)) { shadow_map(v, &r[i]); nshadow++; continue; }
         static volatile int32_t said;
-        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 3)
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 48)
             rt_log("nvn: MapVirtual: a physical pool mapped into a virtual pool, which has shadow storage here: not supported, "
-                   "the pages stay zero");
+                   "the pages stay zero (virtual %p +%#llx, %#llx bytes, physical pool %p +%#llx, flags %#x)", (void *)v->mem,
+                   (unsigned long long)r[i].virtual_offset, (unsigned long long)r[i].size, (const void *)src,
+                   (unsigned long long)r[i].physical_offset, src->flags);
     }
     NVN_LOG("MapVirtual pool %p, %d requests (%d shadowed)", (void *)v->mem, n, nshadow);
     ret_x(c, 1);
