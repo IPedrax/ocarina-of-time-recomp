@@ -324,6 +324,37 @@ VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the 
 programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
 hand-off for it.
 
+## Status (2026-11-08, evening): the flickering level and the occlusion counts
+
+**Measuring flicker without a person.** `OOT_SHOTS=2390-2405:1 OOT_SHOTS_FULL=1 OOT_SHOTS_DIR=...` on the level
+route (`--replay build/logs/a-spam.txt --skip-movies`, 75 s) saves 16 consecutive presents; the share of pixels that
+change by more than 0.3 from one frame and come back the next (an A-B-A pattern) measures the flicker: 10-30% before
+the fix, 0.2-0.6% after.
+
+**Cause: conditional renders on occlusion counts** (`vk_exec_xfer.c`). OoT tests objects with samples-passed reports
+(over 300 a frame, from `main+0x759ac` and `main+0x75ecc` in pairs 0x20 apart, and `main+0x65f44`) and draws them
+under `SetRenderEnableConditional` (mode 1, the counter at addr against the word at addr+16). The replay evaluates the
+condition on the CPU when it records the op: a report of the same submission not done yet counts as unknown and
+renders. Those reports were kept in a ring of the last 256; the oldest fell out before their conditions were read, which
+then read guest memory (an older count, mostly 0) and skipped the object, so whole objects (the Deku Tree's trunk,
+roots, branches) vanished in some frames. The pre-merge build `aa53891` did the same. Now a table by address (65536
+entries). Found with `OOT_COND_LOG=<frame>` (evaluations and reports); `OOT_COND_RENDER=1` (render every condition)
+gives a stable but white picture, as the game also gates full-screen passes so.
+
+**The frame rate it cost.** The level ran at about 57 fps because the bug culled objects that should have been drawn;
+with every unknown count rendering, almost nothing is culled and the level runs at 35-38 fps, CPU-bound (`--trace perf`:
+28 ms a frame, GPU 17 ms; not the pointer table: `OOT_GPU_POINTERS=0` gives 38.5). Using the previous frame's count of
+the same address when this frame's is unknown brought 49 fps back but the flicker too: an object drawn in frame N
+occludes its own proxy, its count is 0, it is culled in N+1, and so on (a two-frame oscillation). The console avoids
+it by comparing in GPU order within the frame. Next: evaluate these conditions on the GPU
+(`VK_EXT_conditional_rendering`, available on the test machine): copy each report's query result into a buffer slot
+outside the render pass and wrap the conditional draws in begin/end; first establish what the word at addr+16 holds on
+the console (here it reads 0, so with cumulative counts the condition would always pass, which cannot be the intent).
+
+**Kernels.** `ace1cec0` now takes 0.025 ms (its loop bounds come from the uniform table, main's fcb2936) and its
+black-and-white blocks are gone at frame 2400, but with nothing skipped (`OOT_SKIP_CS=none`) a later scene of the
+`a-spam-long` route (frame ~4880) is black but for Navi, so `ace1cec0` and `3f15911a` stay skipped by default.
+
 ## Status (2026-11-07): the level's frame rate is one kernel
 
 `OOT_CS_TIME=1` on the level route (run 398): one compute kernel, input id `ace1cec038d64d1f` (code hash
