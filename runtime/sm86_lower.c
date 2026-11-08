@@ -64,6 +64,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 
 #define NSCRATCH 12
 #define PROBE_REG 254                                 // OOT_PROBE's capture register (sm86_probe_match)
+static struct { int parsed, on, as_int, n, buf_slot; char hash[17]; uint32_t offset[3], reg[3]; } probe_spec = {.buf_slot = -1};   // probe_parse
 #define RZ 255u
 #define PT 7u
 #define NOREG 0xffffffffu
@@ -83,6 +84,7 @@ typedef struct {
     uint32_t max_gpr;                              // highest general register the program touches
     uint32_t ur_next, scratch_base;                // the pool above max_gpr: uniform registers from ur_next up
     int probe, nprobe; uint32_t probe_index[3], probe_reg[3];   // OOT_PROBE (sm86_probe_match): the instruction and register captured
+    int probe_lx_log2;                                           // OOT_PROBE buffer mode: log2 of the workgroup width
                                                    // to scratch_base, scratch registers from there (allocated
                                                    // on first use, ascending so pairs and runs stay adjacent)
     int nscratch;
@@ -2855,6 +2857,19 @@ static void lower_exit(L *l, const Insn *x) {
         emit(l, 0xe24000000000000full | l->pred);
         return;
     }
+    if (l->probe && probe_spec.buf_slot >= 0) {   // OOT_PROBE buffer mode: the capture into slot buf_slot, under the EXIT's guard
+        uint32_t t = S(l, 0), u = S(l, 1), lo = S(l, 2), hi = S(l, 3);
+        Src cb = {0};
+        cb.kind = 2, cb.cb_bank = 0, cb.cb_off = 0x310 + 16 * (uint32_t)probe_spec.buf_slot;
+        emit(l, 0xf0c8000000000000ull | l->pred | t | ((uint64_t)33 << 20));                                  // S2R t, SR_TID.X
+        emit(l, 0xf0c8000000000000ull | l->pred | u | ((uint64_t)37 << 20));                                  // S2R u, SR_CTAID.X
+        emit(l, base(l, 0x5c18000000000000ull, t, u) | ((uint64_t)t << 20) | ((uint64_t)l->probe_lx_log2 << 39));   // t = (u << lg) + t
+        emit(l, base(l, 0x5c18000000000000ull, t, t) | ((uint64_t)RZ << 20) | ((uint64_t)2 << 39));          // t = t << 2
+        emit(l, base(l, 0x4c10000000000000ull, lo, t) | cbuf_bits(&cb) | ((uint64_t)1 << 47));              // IADD.CC lo, t, c[0][base]
+        cb.cb_off += 4;
+        emit(l, base(l, 0x4c10000000000000ull, hi, RZ) | cbuf_bits(&cb) | ((uint64_t)1 << 43));             // IADD.X hi, RZ, c[0][base + 4]
+        emit(l, 0xeed8000000000000ull | l->pred | PROBE_REG | ((uint64_t)lo << 8) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));   // STG.E.32 [lo], R254
+    }
     if (pc != 7) {
         if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
         emit(l, 0xe30000000000000full | ((uint64_t)pc << 16));
@@ -3116,7 +3131,6 @@ void sm86_lower_free(Sm86Lowered *out) {
 // The frame dump's statistics of the images the program writes (images.txt: min, max, NaN count) then describe that
 // register at that point, e.g. whether a value is already NaN there: bisect the instructions to the first that makes
 // one. gfx_shader.c gives the probed program a cache key of its own (its input id stays, so OOT_DUMP=cs: finds it).
-static struct { int parsed, on, as_int, n; char hash[17]; uint32_t offset[3], reg[3]; } probe_spec;
 static void probe_parse(void) {
     if (probe_spec.parsed) return;
     probe_spec.parsed = 1;
@@ -3135,6 +3149,13 @@ static void probe_parse(void) {
         // float statistics of the dump read integers (counts, indices, addresses' low words below 2^24 exactly)
         const char *t = strrchr(e, ':');
         probe_spec.as_int = t && t[1] == 'i';
+        // ...:b<slot> (buffer mode, compute only; for kernels that write no image): R254 starts as 0xfeedface (a thread
+        // that never passes the instruction keeps it), and before every EXIT each thread stores the capture, as raw
+        // bits, at byte 4 * (ctaid.x * width + tid.x) of the buffer in storage slot <slot> (c0 + 0x310 + 16 * slot,
+        // the table vk_exec_draw.c fills for compute). With OOT_MEMORY=import the stores land in guest memory, which
+        // OOT_WATCH_DUMP (watch.c) writes to a file. The slot's buffer is overwritten: a diagnostic.
+        const char *bs = strstr(e, ":b");
+        if (bs) probe_spec.buf_slot = atoi(bs + 2), probe_spec.as_int = 0;
     }
 }
 int sm86_probe_match(const uint8_t *code, uint32_t len) {
@@ -3188,7 +3209,14 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         l.probe = 1, l.nprobe = probe_spec.n;
         for (int k = 0; k < l.nprobe; k++) {
             l.probe_index[k] = (probe_spec.offset[k] - header) / 16, l.probe_reg[k] = probe_spec.reg[k];
-            emit(&l, MOV32I | ((uint64_t)7 << 16) | (PROBE_REG - (uint32_t)k) | ((uint64_t)0xf << 12));   // = 0, unconditionally
+            uint64_t init = probe_spec.buf_slot >= 0 ? 0xfeedfaceull : 0;   // buffer mode: a sentinel for "never reached"
+            emit(&l, MOV32I | ((uint64_t)7 << 16) | (PROBE_REG - (uint32_t)k) | ((uint64_t)0xf << 12) | (init << 20));   // unconditionally
+        }
+        if (probe_spec.buf_slot >= 0) {
+            uint32_t lx = c.local[0], lg = 0;
+            while ((1u << lg) < lx) lg++;
+            if (!lx || (1u << lg) != lx || probe_spec.buf_slot > 15) fail(&l, "OOT_PROBE buffer mode: workgroup width not a power of two");
+            l.probe_lx_log2 = (int)lg;
         }
     }
     for (l.index = 0; l.index < l.n && !l.failed; l.index++) {

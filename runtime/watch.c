@@ -12,6 +12,10 @@
 // reads each u64 every millisecond and logs every change it sees, at most 256: for values the GPU writes, which
 // no trap catches (with OOT_MEMORY=import they land in the memory the CPU reads).
 //
+// OOT_WATCH_DUMP=<addr>:<len>@<frame>: at that frame the watch thread writes <len> bytes of guest memory at <addr> to
+// build/logs/watchdump-<addr>.bin (relative to the working directory, the repository under tools/run.py), e.g. what
+// OOT_PROBE's buffer mode stored (with OOT_MEMORY=import, where GPU writes land in guest memory).
+//
 // The debug registers are per thread and survive fiber switches, so a helper thread arms every thread of the
 // process (suspend, set DR0-3 and DR7, resume) and checks for new ones every 200 ms. The trap comes after the write,
 // as EXCEPTION_SINGLE_STEP with the address's bit set in DR6; the handler logs, clears DR6 and continues.
@@ -35,6 +39,7 @@ static struct {
     uintptr_t exe_lo, exe_hi;
     int np;
     uint64_t poll[4], last[4];
+    uint64_t dump_addr, dump_len, dump_frame;
 } W;
 
 static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *ep) {
@@ -100,6 +105,16 @@ static DWORD WINAPI watch_thread(void *arg) {
     for (int i = 0; i < W.np; i++) W.last[i] = *(volatile const uint64_t *)(uintptr_t)W.poll[i];
     for (DWORD tick = 0;; tick++) {
         int polled = 0, logged = 0;
+        if (W.dump_len && gfx_stats().frames >= W.dump_frame) {
+            char path[64];
+            snprintf(path, sizeof path, "build/logs/watchdump-%llx.bin", (unsigned long long)W.dump_addr);
+            FILE *f = fopen(path, "wb");
+            size_t put = f ? fwrite((const void *)(uintptr_t)W.dump_addr, 1, (size_t)W.dump_len, f) : 0;
+            if (f) fclose(f);
+            rt_log("watch: frame %llu, %llu bytes at %#llx written to %s", (unsigned long long)gfx_stats().frames,
+                   (unsigned long long)put, (unsigned long long)W.dump_addr, f ? path : "(cannot open)");
+            W.dump_len = 0;
+        }
         for (int ms = 0; W.np && ms < 200; ms++, Sleep(1))
             for (int i = 0; i < W.np; i++) {
                 uint64_t v = *(volatile const uint64_t *)(uintptr_t)W.poll[i];
@@ -157,7 +172,14 @@ void watch_start(void) {
         while (*q == ',' || *q == ' ') q++;
         p = q;
     }
-    if (!W.n && !W.np) return;
+    const char *de = cfg_get("OOT_WATCH_DUMP");
+    if (de && *de) {
+        char *q;
+        W.dump_addr = strtoull(de, &q, 0);
+        W.dump_len = *q == ':' ? strtoull(q + 1, &q, 0) : 0;
+        W.dump_frame = *q == '@' ? strtoull(q + 1, NULL, 10) : 0;
+    }
+    if (!W.n && !W.np && !W.dump_len) return;
     const char *f = cfg_get("OOT_WATCH_FROM");
     W.from = f && *f ? strtoull(f, NULL, 10) : 0;
     HMODULE self = GetModuleHandleW(NULL);
