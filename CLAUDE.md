@@ -54,6 +54,12 @@ feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon). Mesh and task sha
 `docs/mesh-tracker.md`; pointers that shaders load from memory: `docs/pointers.md`. Since #12 (2026-11-08) the level
 draws its geometry at about 59 fps, with large white areas and stretched triangles, and two kernels skipped by default
 (`SKIP_CS_DEFAULT`): `docs/level.md` is the hand-off for that (measurements, what Fritchii and Hookshot do, the plan).
+#13 (occlusion reports kept per address) made objects stop vanishing. Most of the white is missing geometry with the
+sky showing through; the culling chain's indirect records are written by the game's CPU code (`main+0x566fd0` via
+`main+0x2bfd340`) from what it reads back out of pass 0's output (`0x29bb9c000`, via `main+0x2bfd750`), and it
+reads 0 (`docs/level.md`). The game embeds Lua, whose errors longjmp: `runtime/sjlj.c` with recomp/gen.py's
+`RT_SETJMP` at every call to a setjmp PLT stub (since d105aa9; before it the game died at `main+0x1661690`).
+Long runs need memory headroom: the game commits about 21 GB on the level.
 `python3.14 tools/shader_census.py --version v131072 --lower` lowers the whole corpus (14,363 programs) and lists
 the refusals in `build/v131072/shaders/lowered.txt`.
 

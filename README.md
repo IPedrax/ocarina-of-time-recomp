@@ -11,25 +11,31 @@ core survives a new console generation.
 
 ## Status
 
-As of 2026-11-06 (details and dates in [docs/plan.md](docs/plan.md), the shader work in
-[docs/phase3.md](docs/phase3.md)):
+As of 2026-11-08 the game is playable from the title through its opening into Kokiri Forest, at about 50-60 fps on an
+RTX 4070, but it doesn't look right yet. Details and dates are in [docs/plan.md](docs/plan.md), the shader work in
+[docs/phase3.md](docs/phase3.md), and the state of the level picture in [docs/level.md](docs/level.md).
+
+What works:
 
 - The dump extracts (`tools/extract_nup.py`, the Switch 2's `.nup` container and zbic-compressed NSOs), the three
-  game modules lift to C and `oot.exe` builds and links (Phase 1).
-- The game runs its whole start-up without a crash: audio, saves, the NPLN services offline, 3,661 shader programs
-  loaded, and presents frames (Phase 2). On the way the port met the Switch 2 and SDK 22 differences listed in the
-  plan (new kernel queries, thread-local layout, PAC prologues, NVN2 entry points).
-- Phase 3, the shaders: the Switch 2's shaders are SM86 (Ampere) code in an NVN2 container, which the Maxwell
-  translator from the earlier ports cannot read. `tools/shader_census.py` pulls the 14,363 programs out of the game's
-  archives, `runtime/sm86_lower.c` lowers them to Maxwell in front of the unchanged translator (93.6% of the corpus
-  lowers, and every lowered program translates), and the host binds the lowered jump tables itself. With that the
-  boot logo renders at 60 fps through translated shaders.
-- The title screen, which in this version is a looping cinematic, plays. SDK 22's movie library decodes through
-  console services this host does not serve; `runtime/ov_movie22.c` replaces it and decodes the AV1 stream with
-  dav1d, and the game's neural upscaler, which runs on the Switch 2's tensor cores (HMMA, LDSM, MOVM), upscales it
-  to 2560x1440. HMMA runs on the host GPU's tensor cores through Vulkan cooperative matrices, and the title plays at
-  60 fps. Next: the 656 skinning vertex shaders the lowering still
-  refuses (register pressure), the mesh stages, and whatever lies past the cinematic.
+  game modules lift to C and `oot.exe` builds and links. Start-up runs without a crash: audio, saves, the online
+  services offline.
+- Shaders: the Switch 2's are SM86 (Ampere) code, which the Maxwell translator from the earlier ports can't read.
+  `runtime/sm86_lower.c` lowers them to Maxwell in front of the translator; 14,334 of the game's 14,363 programs
+  lower. The game's neural upscaler runs on the host GPU's tensor cores (Vulkan cooperative matrices).
+- The title screen and menu render correctly at 60 fps; the opening cinematic plays (AV1, decoded with dav1d).
+- In the game: mesh and task shaders, bindless textures, pointers that shaders load from memory, occlusion queries,
+  and the game's embedded Lua (its error handling uses `setjmp`/`longjmp`, which the runtime now supports).
+
+What doesn't work yet:
+
+- The level draws most of its geometry, but some is still missing. Where it's missing, the bright sky shows through
+  as white areas, and long white triangles cross the view. The game's culling pass still counts nothing, so its
+  mesh draws draw nothing; finding why is the current work (`docs/level.md`).
+- Two compute kernels are skipped by default because they write wrong values (`OOT_SKIP_CS=none` runs them).
+- Not yet tested beyond the first area. Only checked on NVIDIA; an AMD RX 9060 XT hangs after the title (#9).
+
+Contributors' work landed in #2, #4, #5, #10, #12 and #13 (and a cherry-pick from #7); thank you.
 
 This repository contains no game content. You need your own dump of the game and the keys from your own console. The
 content check (`tools/check_content.py`, run by the pre-commit hook and CI) keeps it that way.
