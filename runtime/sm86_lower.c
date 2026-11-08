@@ -1233,7 +1233,14 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
 static void lower_imad(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8);
     Src a = src0(x, 0), b = srcn(l, x, 1, 0), c = srcn(l, x, 2, 0);
-    int ext = bits(x, 74, 1), neg_c = bits(x, 75, 1);
+    // The addend's negate follows the addend: bit 75 when it is the register at 64-71, bit 63 when a constant (form
+    // 3) or a uniform register (form 7) takes the wide slot (srcn), where 75 is b's negate instead. A 32-bit
+    // immediate addend (form 2) has no negate bit. Bit 75 alone made IMAD.MOV.U32 Rd, RZ, RZ, -UR4 a +UR4 (found
+    // comparing with Fritchii's lowering and Mesa NAK's encoder, 2026-11-08).
+    uint32_t form = bits(x, 9, 3);
+    int c_wide = form == 2 || form == 3 || form == 7;
+    int ext = bits(x, 74, 1), neg_c = c_wide ? (form == 2 ? 0 : bits(x, 63, 1)) : bits(x, 75, 1);
+    if (c_wide && bits(x, 75, 1)) return (void)fail(l, "IMAD negated product");
     if (bits(x, 76, 5) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) || (!ext && bits(x, 87, 4) != 15))
         return (void)fail(l, "IMAD mode");
     if (ext) {
