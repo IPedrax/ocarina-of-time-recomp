@@ -64,7 +64,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 
 #define NSCRATCH 12
 #define PROBE_REG 254                                 // OOT_PROBE's capture register (sm86_probe_match)
-static struct { int parsed, on, as_int, n, buf_slot, nreach; char hash[17]; uint32_t offset[3], reg[3], reach[32]; } probe_spec = {.buf_slot = -1};   // probe_parse
+static struct { int parsed, on, as_int, n, buf_slot, nreach, sample_shift; char hash[17]; uint32_t offset[3], reg[3], reach[32]; } probe_spec = {.buf_slot = -1};   // probe_parse
 #define RZ 255u
 #define PT 7u
 #define NOREG 0xffffffffu
@@ -2865,11 +2865,16 @@ static void lower_exit(L *l, const Insn *x) {
         emit(l, 0xf0c8000000000000ull | l->pred | t | ((uint64_t)33 << 20));                                  // S2R t, SR_TID.X
         emit(l, 0xf0c8000000000000ull | l->pred | u | ((uint64_t)37 << 20));                                  // S2R u, SR_CTAID.X
         emit(l, base(l, 0x5c18000000000000ull, t, u) | ((uint64_t)t << 20) | ((uint64_t)l->probe_lx_log2 << 39));   // t = (u << lg) + t
-        emit(l, base(l, 0x5c18000000000000ull, t, t) | ((uint64_t)RZ << 20) | ((uint64_t)2 << 39));          // t = t << 2
+        int many = probe_spec.n > 1;   // several captures: four words a thread, capture k at word k
+        if (probe_spec.sample_shift)   // :s<k>: the sample index, thread index >> k
+            emit(l, base(l, 0x3828000000000000ull, t, t) | ((uint64_t)probe_spec.sample_shift << 20));   // SHR t, t, k
+        emit(l, base(l, 0x5c18000000000000ull, t, t) | ((uint64_t)RZ << 20) | ((uint64_t)(many ? 4 : 2) << 39));   // t = t << 2 (or 4)
         emit(l, base(l, 0x4c10000000000000ull, lo, t) | cbuf_bits(&cb) | ((uint64_t)1 << 47));              // IADD.CC lo, t, c[0][base]
         cb.cb_off += 4;
         emit(l, base(l, 0x4c10000000000000ull, hi, RZ) | cbuf_bits(&cb) | ((uint64_t)1 << 43));             // IADD.X hi, RZ, c[0][base + 4]
-        emit(l, 0xeed8000000000000ull | l->pred | PROBE_REG | ((uint64_t)lo << 8) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));   // STG.E.32 [lo], R254
+        for (int k = 0; k < (many ? probe_spec.n : 1); k++)   // STG.E.32 [lo + 4k], R(254 - k)
+            emit(l, 0xeed8000000000000ull | l->pred | (PROBE_REG - (uint32_t)k) | ((uint64_t)lo << 8) | ((uint64_t)(4 * k) << 20) |
+                        ((uint64_t)1 << 45) | ((uint64_t)4 << 48));
     }
     if (pc != 7) {
         if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
@@ -3156,13 +3161,13 @@ static void probe_parse(void) {
         }
         return;
     }
-    if (e && sscanf(e, "%16[0-9a-fA-F]:%x:%u", h, &off, &reg) == 3 && reg < 255) {
+    if (e && sscanf(e, "%16[0-9a-fA-F]:%x:%u", h, &off, &reg) == 3 && reg < 256) {   // 255: the predicates (P2R)
         snprintf(probe_spec.hash, sizeof probe_spec.hash, "%s", h);
         probe_spec.offset[0] = off, probe_spec.reg[0] = reg, probe_spec.on = 1, probe_spec.n = 1;
         // ,<offset>:<register> up to three captures in one run: the k-th goes to R(254 - k), and every SUST writes
         // capture (channel % n) in each channel, so the dump's per-channel statistics answer three questions at once
         for (const char *p = strchr(e, ','); p && probe_spec.n < 3; p = strchr(p + 1, ','))
-            if (sscanf(p + 1, "%x:%u", &off, &reg) == 2 && reg < 255)
+            if (sscanf(p + 1, "%x:%u", &off, &reg) == 2 && reg < 256)
                 probe_spec.offset[probe_spec.n] = off, probe_spec.reg[probe_spec.n] = reg, probe_spec.n++;
         // <code hash>:<offset>:<register>:i captures the register as an unsigned integer converted to float, so the
         // float statistics of the dump read integers (counts, indices, addresses' low words below 2^24 exactly)
@@ -3175,6 +3180,10 @@ static void probe_parse(void) {
         // OOT_WATCH_DUMP (watch.c) writes to a file. The slot's buffer is overwritten: a diagnostic.
         const char *bs = strstr(e, ":b");
         if (bs) probe_spec.buf_slot = atoi(bs + 2), probe_spec.as_int = 0;
+        // ...:s<k>: one sample per 2^k threads (thread index >> k picks the slot word; the last writer of a group
+        // wins), so a small buffer covers the whole dispatch: s5 is one thread a warp.
+        const char *ss = strstr(e, ":s");
+        if (ss) probe_spec.sample_shift = atoi(ss + 2);
     }
 }
 int sm86_probe_match(const uint8_t *code, uint32_t len) {
@@ -3257,7 +3266,9 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         for (int k = 0; l.probe && k < l.nprobe; k++) {
             uint32_t cap = PROBE_REG - (uint32_t)k;
             if (l.index != l.probe_index[k]) continue;
-            if (probe_spec.as_int)   // I2F.F32.U32, unconditionally
+            if (l.probe_reg[k] == 255)   // the predicates P0-P6 as bits 0-6 (P2R cap, PR, RZ, 0x7f), unconditionally
+                emit(&l, 0x38e8000000000000ull | ((uint64_t)7 << 16) | cap | ((uint64_t)RZ << 8) | ((uint64_t)0x7f << 20));
+            else if (probe_spec.as_int)   // I2F.F32.U32, unconditionally
                 emit(&l, 0x5cb8000000000000ull | ((uint64_t)7 << 16) | cap | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) |
                              ((uint64_t)l.probe_reg[k] << 20));
             else   // the capture, unconditionally (a guarded write may not have happened)
