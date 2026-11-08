@@ -69,7 +69,9 @@ def write(romfs, out):
     t0 = time.monotonic()
     manifest = json.loads((romfs / 'index.json').read_text(encoding='utf-8'))
     if manifest.get('status') != 'pass':
-        sys.exit(f'romfs_index: {romfs / "index.json"} does not record a verified extraction')
+        sys.exit(f'romfs_index: {romfs / "index.json"} does not record a verified extraction (status '
+                 f'{manifest.get("status")!r}): extract it again with tools/extract_nup.py, without --no-verify '
+                 f'(add --romfs-only to leave the ExeFS as it is)')
     image = romfs / 'romfs.bin'
     if not image.is_file() or image.stat().st_size != manifest['romfs_size']:
         sys.exit(f'romfs_index: {image} is missing or its size differs from index.json')

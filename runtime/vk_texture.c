@@ -57,6 +57,7 @@ typedef struct Tex {
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
+    uint64_t depth_synced;        // sync_from_depth: wr_fence of the depth view last copied in
     uint8_t listed;               // in owned[]
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
@@ -284,7 +285,8 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
         barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-    } else if (vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !format_compressed(e->f.vk)) {
+    } else if (vk_fix_zero() && (!e->bound_to || getenv("OOT_ZERO_ALIASED")) && !e->pub.mirrored &&
+               !format_compressed(e->f.vk)) {   // OOT_ZERO_ALIASED (diagnostic): images placed in pool memory too
         // GPU-only storage that got memory of its own starts at zero, as the pool it stands for (vk_memory.c
         // alloc_physical). Images aliasing pool memory are not cleared: that would erase what other textures rendered
         // there; mirrored images are uploaded from their storage on first use.
@@ -663,8 +665,30 @@ static void tex_raw_dump(const nvn_texdesc *d, const uint8_t *blocks, size_t siz
     }
 }
 
+// 1 when [p, p + n) is committed, readable host memory. The texture pool holds descriptors over storage the game has
+// unmapped or not mapped yet (OoT, 2026-11-06: ids nothing samples, over physical memory at 0x5864xxxxx), harmless on
+// the console while no shader reads them. Pool-indexed sampling (vk_exec_draw.c pool sets) resolves every id, so
+// their upload reads that memory, which faulted in tex_bl_copy.
+// An imported pool that backs the whole range is guest memory the CPU maps, so readable, and asking vk_mem_resolve is
+// cheap; VirtualQuery is not: on the level's large committed regions it walks page tables for milliseconds per call
+// (as vk_exec_draw.c ptr_readable found), and asked for every texture upload it froze the level's first frame for
+// about 7 s (2026-11-08, worst frame "texture upload 6955 ms", against 168 ms before it). It stays the fallback for
+// storage no pool claims, such as that of a finalized pool.
+static int storage_readable(const void *p, size_t n) {
+    VkMemSpan sp;
+    if (vk_mem_resolve((uint64_t)(uintptr_t)p, n, &sp) && sp.pool) return 1;
+    const uint8_t *a = p, *end = a + n;
+    while (a < end) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return 0;
+        a = (const uint8_t *)mi.BaseAddress + mi.RegionSize;
+    }
+    return 1;
+}
+
 static void upload(Tex *e) {
-    static volatile long n_bad, n_undecoded;
+    static volatile long n_bad, n_undecoded, n_unmapped;
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
@@ -688,6 +712,10 @@ static void upload(Tex *e) {
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
         }
+    int readable = storage_readable(t->mem, (size_t)t->L.size);
+    if (!readable)
+        log_limited(&n_unmapped, "texture %#llx fmt %#x (%ux%u): its storage is not mapped; uploaded as zeros",
+                    (unsigned long long)e->pub.addr, d->format, d->width, d->height);
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, rbuf = VK_NULL_HANDLE;
     VmaAllocation ralloc = NULL;
@@ -699,7 +727,9 @@ static void upload(Tex *e) {
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
             uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
-            if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
+            if (!readable) {
+                memset(tmp ? tmp : dst, 0, raw);
+            } else if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
@@ -779,7 +809,9 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
 }
 
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
+static void sync_from_depth(Tex *e);
 static void make_fresh(Tex *e) {
+    sync_from_depth(e);
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
     uint64_t size = e->t.L.size;
     if (!e->uploaded) {
@@ -798,6 +830,7 @@ static void make_fresh(Tex *e) {
 // vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
 static void make_fresh_snap(Tex *e) {
+    sync_from_depth(e);
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
     uint32_t now;
     n_checks++;
@@ -885,6 +918,46 @@ static int alias_copy(Tex *e, const Tex *src) {
     vk_exec_inline_end(reopen);
     free(rg);
     return 1;
+}
+
+// A colour view of a depth image's memory (Maxwell reads the same bytes through both descriptors; here they are two
+// images): a R32_SFLOAT entry the GPU never wrote itself takes the D32_SFLOAT content of a live entry at the same
+// address and shape each time that one was written since. The level's fog kernel 1a62084a samples a 4096x4096 static
+// shadow depth so; its view stayed zero, every visibility weight came out 0, a normalisation 1 / 0 = inf and then
+// 0 * inf = NaN in every voxel, which the fog composite spread over the scene (2026-11-07, OOT_PROBE). Through a buffer
+// as alias_copy, with the depth aspect on the read side; recorded at the replay's current position.
+static void sync_from_depth(Tex *e) {
+    if (e->f.vk != VK_FORMAT_R32_SFLOAT || e->wr_fence || e->pub.samples > 1) return;
+    Tex *src = NULL;
+    for (Tex *q = nvn_hm_get(&by_addr, &e->key.addr); q; q = q->next_at)
+        if (q != e && !q->released && q->f.vk == VK_FORMAT_D32_SFLOAT && q->wr_fence > e->depth_synced &&
+            q->pub.width == e->pub.width && q->pub.height == e->pub.height && q->pub.depth == e->pub.depth &&
+            q->pub.samples == 1 && (!src || q->wr_fence > src->wr_fence))
+            src = q;
+    if (!src) return;
+    int reopen;
+    VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
+    if (!cb) return;
+    uint32_t layers = e->pub.layers < src->pub.layers ? e->pub.layers : src->pub.layers;
+    VkDeviceSize size = (VkDeviceSize)e->pub.width * e->pub.height * e->pub.depth * 4 * layers;
+    VkBuffer buf = vk_exec_inline_buffer(size);
+    if (!buf) { vk_exec_inline_end(reopen); return; }
+    VkBufferImageCopy rd = {.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, layers},
+                            .imageExtent = {e->pub.width, e->pub.height, e->pub.depth}};
+    VkBufferImageCopy wr = rd;
+    wr.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyImageToBuffer(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &rd);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyBufferToImage(cb, buf, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, 1, &wr);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    vk_exec_inline_end(reopen);
+    e->depth_synced = src->wr_fence;
+    static int logged;
+    if (logged++ < 8)
+        rt_log("vk: %ux%u R32_SFLOAT view at %#llx takes its depth view's content (fence %llu)", e->pub.width,
+               e->pub.height, (unsigned long long)e->pub.addr, (unsigned long long)src->wr_fence);
 }
 
 static Tex *entry_of(const tex_t *t) {
@@ -1161,6 +1234,18 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     if (view) *view = has_view ? s->cview : s->v;
     if (has_view) *has_view = view ? s->chas_view : s->has_view;
     return e ? &e->pub : NULL;
+}
+
+// The lookup of pool-indexed sampling (vk_exec_draw.c pool sets), which resolves every id of a pool, sampled or not: NULL
+// unless a live texture object (initialized, not finalized: nvn_tex_live_at) has the slot's storage. The pool keeps
+// the descriptors of finalized textures; vk_texture_by_id_locked brings such a texture back as a new entry that is
+// never released again, and done for every stale id that filled the VRAM, which dropped released entries, which came
+// back the same way (OoT level, 2026-11-06: under 1 fps).
+const VkTexImage *vk_texture_live_by_id_locked(int id, view_t *view, int *has_view) {
+    if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
+    tex_t live;
+    if (!nvn_tex_live_at(tslots[id].t.mem, &live)) return NULL;
+    return vk_texture_by_id_locked(id, view, has_view);
 }
 
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.

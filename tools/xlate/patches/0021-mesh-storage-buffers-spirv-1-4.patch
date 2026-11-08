@@ -1,0 +1,42 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -125,9 +125,13 @@
+ 
+                 SpvInstruction structType = context.TypeStruct(false, structFieldTypes);
+ 
++                // SPIR-V 1.4 (task and mesh programs, SpirvGenerator.cs) has no BufferBlock: storage buffers are Block
++                // in the StorageBuffer class there (ocarina-of-time-recomp, docs/mesh.md).
++                bool storageClassBuffer = isBuffer && context.Definitions.MeshStage != 0;
++
+                 if (decoratedTypes.Add(structType))
+                 {
+-                    context.Decorate(structType, isBuffer ? Decoration.BufferBlock : Decoration.Block);
++                    context.Decorate(structType, isBuffer && !storageClassBuffer ? Decoration.BufferBlock : Decoration.Block);
+ 
+                     for (int fieldIndex = 0; fieldIndex < structFieldOffsets.Length; fieldIndex++)
+                     {
+@@ -135,8 +139,9 @@
+                     }
+                 }
+ 
+-                SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
+-                SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
++                StorageClass bufferClass = storageClassBuffer ? StorageClass.StorageBuffer : StorageClass.Uniform;
++                SpvInstruction pointerType = context.TypePointer(bufferClass, structType);
++                SpvInstruction variable = context.Variable(pointerType, bufferClass);
+ 
+                 context.Name(variable, buffer.Name);
+                 context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1873,7 +1873,9 @@
+                         : context.Properties.StorageBuffers[bindingIndex.Value];
+                     StructureField field = buffer.Type.Fields[fieldIndex.Value];
+ 
+-                    storageClass = StorageClass.Uniform;
++                    storageClass = storageKind == StorageKind.StorageBuffer && context.Definitions.MeshStage != 0
++                        ? StorageClass.StorageBuffer   // SPIR-V 1.4 (Declarations.cs DeclareBuffers)
++                        : StorageClass.Uniform;
+                     varType = field.Type & AggregateType.ElementTypeMask;
+                     baseObj = storageKind == StorageKind.ConstantBuffer
+                         ? context.ConstantBuffers[bindingIndex.Value]

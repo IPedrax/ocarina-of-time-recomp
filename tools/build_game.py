@@ -70,6 +70,11 @@ import romfs_index
 from build_shaders import stale as stale_shaders
 from check_content import GENERATED_MARKER
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parent.parent
 # In a git worktree (tools/worktree.py) build/ and generated/ are junctions into the main checkout, and resolve() follows
 # them. MAIN_ROOT is where they land, so resolved paths still print and compare relative to a root.
@@ -100,7 +105,7 @@ INSTALL_SIDE = {'romfs.c', 'patches.c'}
 LIB_NAME = 'libootrt.a'
 # --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
 if sys.platform == 'win32':
-    UCRT = Path(r'C:\msys64\ucrt64\bin')
+    UCRT = MSYS2_ROOT / r'ucrt64\bin'
     CLANG = UCRT / 'clang.exe'
     NINJA = UCRT / 'ninja.exe'
     SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll',
@@ -716,7 +721,7 @@ def main():
         dlls = sorted((DEPS / 'bin').glob('*.dll'))
     for tool in (CLANG, NINJA):
         if not tool.is_file():
-            sys.exit(f'{tool} not found: install MSYS2 UCRT64 clang, lld and ninja on Windows, or clang and ninja on Linux (docs/building.md)')
+            sys.exit(f'{tool} not found: install MSYS2 UCRT64 clang, lld and ninja on Windows, or clang and ninja on Linux (README.md, Building)')
     if not (gen / 'layout.json').is_file():
         sys.exit(f'{gen / "layout.json"} not found: run the generator first')
 

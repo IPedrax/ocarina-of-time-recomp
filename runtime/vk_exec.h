@@ -82,10 +82,10 @@ typedef struct VkExec {
     // ---- vk_exec_draw.c slots (draws, binds, dispatch): left empty by vk_exec.c
     const prog_t *prog;                  // OP_BIND_PROGRAM: the program serving every stage (vk_exec_draw.c bind_program)
     int32_t prog_stages;
-    const prog_t *stage_prog[6];         // the program bound for each NVN stage (separable binds)
+    const prog_t *stage_prog[8];         // the program bound for each NVN stage (separable binds; 6 task, 7 mesh)
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
-    p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
-    uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
+    p_bind_buf ubo[8][18], ssbo[8][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
+    uint64_t tex[8][128], samp[8][128], img[8][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
     uint8_t push_cc[0x800];              // OP_PUSH_CC (VK_C0_BYTES, defined below): the compute kernels' pushed constants (NVN2), read as bank 0
     uint32_t push_cc_len;                // bytes pushed so far (0: none, c0 is the driver bank)
 
@@ -187,8 +187,9 @@ void vk_dump_note(const char *fmt, ...);   // vk_dump.c: a line in passes.txt of
 void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump frame's copies and closes the logs
 
 // c0, the NVN driver constant bank of one stage (vk_exec_draw.c; OOT_FIX_C0=0 binds zeros instead): bank is
-// VK_C0_BYTES, stage an NVN stage (0 vertex, 1 fragment, 5 compute), ssbo and ubo the 16 bound slots of that stage.
-#define VK_C0_BYTES 0x800u
+// VK_C0_BYTES, stage an NVN stage (0 vertex, 1 fragment, 5 compute, 6 task, 7 mesh), ssbo and ubo the 16 bound slots
+// of that stage.
+#define VK_C0_BYTES 0x880u   // through the mesh stage's storage table at 0x770 (vk_c0_fill)
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance);
 
@@ -212,3 +213,4 @@ void vk_exec_xfb_pass_end(VkExec *ex, int after);
 // when counting and none is active), and the open pass about to end (ends the active query).
 void vk_exec_oq_draw(VkExec *ex);
 void vk_exec_oq_pass_end(VkExec *ex);
+void vk_exec_pool_feedback(VkExec *ex);   // vk_exec_draw.c: copies the pool sets' sampling feedback for the host

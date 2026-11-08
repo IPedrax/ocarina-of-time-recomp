@@ -5,7 +5,7 @@
 // VK_EXT_external_memory_host). Between presents frame-1 and frame, the replay's command buffers also copy, after each
 // render pass, its colour and depth targets and, after each dispatch, the storage images it writes into host buffers;
 // the completion thread turns them into 8-bit PNGs once the submission is done. 3D textures (LUTs, volumes) sampled or
-// written in the frame are copied once each, slices side by side. Files in OOT_DUMP_DIR (default "dump"):
+// written in the frame are copied once each, slices side by side. Files in OOT_DUMP_DIR (default: "dump" next to oot.exe):
 //   pass_<seq>_t<i>_<w>x<h>_<vkformat>_<name>.png   colour target i (td: depth; img<slot>: storage image; lut<id>: 3D;
 //                                                    a BC target drawn through a block view: its blocks as that view)
 //   ..._tm.png                                       float formats: x/(1+x) of the same image (the plain one clamps)
@@ -231,14 +231,14 @@ static void write_images(const Job *j) {
     uint8_t *out = malloc(n * 4);
     if (!px || !out) rt_fatal("vk_dump: out of memory for %s", j->name);
     float mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-    uint64_t nans = 0;
+    uint64_t nans = 0, cnan[4] = {0};
     for (uint32_t z = 0; z < j->d; z++)
         for (uint32_t y = 0; y < j->h; y++)
             for (uint32_t x = 0; x < j->w; x++) {
                 float *o = px + 4 * ((uint64_t)y * pw + (uint64_t)z * j->w + x);
                 decode(j->f, j->map + (((uint64_t)z * j->h + y) * j->w + x) * j->f->bytes, o);
                 for (int c = 0; c < 4; c++) {
-                    if (isnan(o[c])) { nans++, o[c] = 0; continue; }
+                    if (isnan(o[c])) { nans++, cnan[c]++, o[c] = 0; continue; }
                     if (o[c] < mn[c]) mn[c] = o[c];
                     if (o[c] > mx[c]) mx[c] = o[c];
                 }
@@ -278,9 +278,10 @@ static void write_images(const Job *j) {
     uint64_t all = distinct(j, 0, j->h), top = distinct(j, 0, j->h / 4 ? j->h / 4 : 1);
     plat_mutex_lock(&img_lock);
     if (images_f) {
-        fprintf(images_f, "%s %ux%ux%u min %g %g %g %g max %g %g %g %g distinct %llu top-quarter %llu nan %llu\n", j->name,
-                j->w, j->h, j->d, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], (unsigned long long)all,
-                (unsigned long long)top, (unsigned long long)nans);
+        fprintf(images_f, "%s %ux%ux%u min %g %g %g %g max %g %g %g %g distinct %llu top-quarter %llu nan-per-channel %llu %llu %llu %llu nan %llu\n",
+                j->name, j->w, j->h, j->d, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], (unsigned long long)all,
+                (unsigned long long)top, (unsigned long long)cnan[0], (unsigned long long)cnan[1], (unsigned long long)cnan[2],
+                (unsigned long long)cnan[3], (unsigned long long)nans);
         fflush(images_f);
     }
     plat_mutex_unlock(&img_lock);
@@ -574,7 +575,7 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
 
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
-    static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
+    static const char *stn[8] = {"vs", "fs", "?", "?", "?", "cs", "ts", "ms"};
     if (info->n_bindings) {   // DIAG (NVN2 bank 0 layout): every bound texture, image and uniform slot of the stage
         int st = nvn_stage(info->bindings[0].stage);
         sp(b, "    %s bound tex:", stn[st]);
@@ -595,6 +596,38 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                 if (ex->ssbo[st][k].addr)
                     sp(b, " %d=%#llx+%#llx", k, (unsigned long long)ex->ssbo[st][k].addr, (unsigned long long)ex->ssbo[st][k].size);
             sp(b, "\n");
+            // The first 64 bytes of the small ones, as the CPU holds them (imported pools only), and the pool class:
+            // pointers in storage buffers (vk_exec_draw.c ptr_targets_add) show here.
+            for (int k = 0; k < 16; k++) {
+                const p_bind_buf *sb = &ex->ssbo[st][k];
+                VkMemSpan msp;
+                if (!sb->addr || !sb->size || sb->size > 1024) continue;
+                int backed = vk_mem_resolve(sb->addr, sb->size, &msp);
+                sp(b, "      slot %d: class %d%s", k, backed ? msp.cls : -1, backed && msp.pool ? "" : " (not CPU-readable)");
+                if (backed && msp.pool)
+                    for (uint64_t o = 0; o + 8 <= sb->size && o < 64; o += 8)
+                        sp(b, " %016llx", (unsigned long long)*(const uint64_t *)(uintptr_t)(sb->addr + o));
+                sp(b, "\n");
+                // and 64 bytes at each word that is an address of CPU-readable pool memory, as 32-bit words
+                for (uint64_t o = 0; backed && msp.pool && o + 8 <= sb->size && o < 64; o += 8) {
+                    uint64_t v = *(const uint64_t *)(uintptr_t)(sb->addr + o);
+                    VkMemSpan tsp;
+                    if (v < 0x10000 || (v >> 40) || (v & 3) || !vk_mem_resolve(v, 64, &tsp)) continue;
+                    sp(b, "        +%#llx -> %#llx class %d:", (unsigned long long)o, (unsigned long long)v, tsp.cls);
+                    if (tsp.pool)
+                        for (int w = 0; w < 16; w++) sp(b, " %08x", ((const uint32_t *)(uintptr_t)v)[w]);
+                    sp(b, "\n");
+                }
+            }
+            // The first words of each slot as the CPU sees them (the submission's snapshot, else guest memory): a
+            // CPU-written buffer's contents, e.g. a record count a kernel loops to.
+            for (int k = 0; k < 4; k++) {
+                uint64_t a = ex->ssbo[st][k].addr;
+                const uint32_t *w = a ? vk_usnap_peek(a, 16) : NULL;
+                VkMemSpan msp;
+                if (!w && a && vk_mem_resolve(a, 16, &msp)) w = (const uint32_t *)(uintptr_t)a;
+                if (w) sp(b, "      slot %d words: %08x %08x %08x %08x\n", k, w[0], w[1], w[2], w[3]);
+            }
             continue;
         }
         if (r && bd->kind == GFX_RES_UBO && dump_ubo && r->slot == 1 && ex->prog) {   // the compiler's constant bank
@@ -1030,8 +1063,12 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     last_targets = 0;
     Str b = {0};
     describe_bindings(&b, ex, info);
-    fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx prog %llu caller %#llx, fence %llu\n%s", n, d->x, d->y,
-            d->z, (unsigned long long)shader_hash(cs), (unsigned long long)(ex->prog ? ex->prog->serial : 0),
+    const uint8_t *in_id = gfx_shader_input_id(cs);   // the id OOT_SKIP_CS and OOT_DUMP=cs: take, next to the hash
+    char in_hex[17] = "";
+    for (int i = 0; in_id && i < 8; i++) snprintf(in_hex + 2 * i, 3, "%02x", in_id[i]);
+    fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx (input %s) prog %llu caller %#llx, fence %llu\n%s", n,
+            d->x, d->y, d->z, (unsigned long long)shader_hash(cs), in_hex,
+            (unsigned long long)(ex->prog ? ex->prog->serial : 0),
             (unsigned long long)d->caller, (unsigned long long)ex->fence, b.s ? b.s : "");
     free(b.s);
     for (uint32_t i = 0; i < info->n_bindings && !pass_skip; i++) {   // storage images the dispatch writes
@@ -1184,8 +1221,18 @@ void vk_dump_init(void) {
         w[0] = (uint32_t)strtoul(q, &q, 10);
         w[1] = *q == 'x' ? (uint32_t)strtoul(q + 1, &q, 10) : 0;
     }
+    // Default: "dump" next to oot.exe (under build/, which git ignores). It was "dump" in the working directory, the
+    // repository's root when run.py starts the game: a dump armed with --env OOT_DUMP=... (no OOT_DUMP_DIR) wrote the
+    // game's images into the tree (2026-11-07).
     const char *d = cfg_get("OOT_DUMP_DIR");
-    snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
+    if (d && *d) snprintf(dir, sizeof dir, "%s", d);
+    else {
+        char exe[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
+        char *slash = n ? strrchr(exe, '\\') : NULL;
+        if (slash) *slash = 0, snprintf(dir, sizeof dir, "%s\\dump", exe);
+        else snprintf(dir, sizeof dir, "dump");
+    }
     make_dirs(dir);
     char path[600];
     snprintf(path, sizeof path, "%s/passes.txt", dir);

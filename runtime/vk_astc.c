@@ -4,7 +4,7 @@
 // ASTC textures on the GPU: the OOT_ASTC knob, a compute decoder that turns raw blocks into the RGBA8 image the CPU
 // decoder (tex_astc.c) would have written, and the native ASTC formats where the device samples them itself.
 //
-// OOT_ASTC_BC = 1 (gpu mode only, default 0): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
+// OOT_ASTC_BC = 1 (gpu mode only; unset: on under 12 GiB of video memory, see create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
 // texels to BC3 and the image is BC3, 8 bits per texel instead of 32. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
 //
@@ -301,9 +301,22 @@ static int create_pipeline(VkCtx *c) {
 }
 
 // OOT_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
+// Unset, it is on when the largest device-local heap is under 12 GiB: OoT's levels decoded to RGBA8 outgrow an 8 GiB
+// card (2026-11-08, the village after the Deku Tree: 8.6 GiB of VRAM in use against a 6.8 GiB budget, the driver paging,
+// 150 ms of GPU time a frame and 5-9 fps; with BC3 5.3 GiB, 16-23 ms and 30-34 fps on the same recorded session).
 static int create_bc_pipeline(VkCtx *c) {
     const char *e = cfg_get("OOT_ASTC_BC");
-    if (!e || !*e || *e == '0') return 0;
+    if (!e || !*e) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(c->phys, &mp);
+        VkDeviceSize vram = 0;
+        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+            if ((mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[h].size > vram) vram = mp.memoryHeaps[h].size;
+        int on = vram < (12ull << 30);
+        rt_log("vk: ASTC to BC3 %s by default: %.1f GiB of video memory (OOT_ASTC_BC=0 or 1 decides)", on ? "on" : "off",
+               (double)vram / (1 << 30));
+        if (!on) return 0;
+    } else if (*e == '0') return 0;
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC3_SRGB_BLOCK, &p);
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;

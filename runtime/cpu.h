@@ -4,6 +4,10 @@
 // Adapted from LAS Recomp runtime/cpu.h @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
 // Guest CPU state and helpers used by recompiled code.
 #pragma once
+#ifndef __USE_MINGW_SETJMP_NON_SEH
+#define __USE_MINGW_SETJMP_NON_SEH   // setjmp(b) = _setjmp(b, NULL): longjmp restores registers, no SEH unwinding (RT_SETJMP)
+#endif
+#include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -36,6 +40,12 @@ typedef void (*GuestFn)(Cpu *);
 
 // ---- runtime services (runtime/*.c)
 void rt_dispatch(Cpu *c);                 // call function at c->pc
+// The guest's setjmp/longjmp (runtime/sjlj.c): recomp/gen.py wraps each call to the setjmp PLT stub in
+// `if (!RT_SETJMP(c)) <the call>`, so the host setjmp sits in the generated function's own frame; the host override
+// of longjmp restores the guest registers from the guest jmp_buf and longjmps there. A macro: setjmp must run in the
+// caller's frame.
+jmp_buf *rt_sj_enter(Cpu *c);
+#define RT_SETJMP(c) setjmp(*rt_sj_enter(c))
 void rt_spin_gate(Cpu *c, uint64_t head);  // a pass of a spin wait loop (kernel.c, recomp/patches.py `spin`)
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));

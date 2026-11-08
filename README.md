@@ -11,31 +11,75 @@ core survives a new console generation.
 
 ## Status
 
-As of 2026-11-06 (details and dates in [docs/plan.md](docs/plan.md), the shader work in
-[docs/phase3.md](docs/phase3.md)):
+As of 2026-11-08 the game is playable from the title through its opening into Kokiri Forest, at about 50-60 fps on an
+RTX 4070, but it doesn't look right yet. Details and dates are in [docs/plan.md](docs/plan.md), the shader work in
+[docs/phase3.md](docs/phase3.md), and the state of the level picture in [docs/level.md](docs/level.md).
+
+What works:
 
 - The dump extracts (`tools/extract_nup.py`, the Switch 2's `.nup` container and zbic-compressed NSOs), the three
-  game modules lift to C and `oot.exe` builds and links (Phase 1).
-- The game runs its whole start-up without a crash: audio, saves, the NPLN services offline, 3,661 shader programs
-  loaded, and presents frames (Phase 2). On the way the port met the Switch 2 and SDK 22 differences listed in the
-  plan (new kernel queries, thread-local layout, PAC prologues, NVN2 entry points).
-- Phase 3, the shaders: the Switch 2's shaders are SM86 (Ampere) code in an NVN2 container, which the Maxwell
-  translator from the earlier ports cannot read. `tools/shader_census.py` pulls the 14,363 programs out of the game's
-  archives, `runtime/sm86_lower.c` lowers them to Maxwell in front of the unchanged translator (93.6% of the corpus
-  lowers, and every lowered program translates), and the host binds the lowered jump tables itself. With that the
-  boot logo renders at 60 fps through translated shaders.
-- The title screen, which in this version is a looping cinematic, plays. SDK 22's movie library decodes through
-  console services this host does not serve; `runtime/ov_movie22.c` replaces it and decodes the AV1 stream with
-  dav1d, and the game's neural upscaler, which runs on the Switch 2's tensor cores (HMMA, LDSM, MOVM), upscales it
-  to 2560x1440. HMMA runs on the host GPU's tensor cores through Vulkan cooperative matrices, and the title plays at
-  60 fps. Next: the start-up crash that hits about one run in two, the 656 skinning vertex shaders the lowering still
-  refuses (register pressure), the mesh stages, and whatever lies past the cinematic.
+  game modules lift to C and `oot.exe` builds and links. Start-up runs without a crash: audio, saves, the online
+  services offline.
+- Shaders: the Switch 2's are SM86 (Ampere) code, which the Maxwell translator from the earlier ports can't read.
+  `runtime/sm86_lower.c` lowers them to Maxwell in front of the translator; 14,334 of the game's 14,363 programs
+  lower. The game's neural upscaler runs on the host GPU's tensor cores (Vulkan cooperative matrices).
+- The title screen and menu render correctly at 60 fps; the opening cinematic plays (AV1, decoded with dav1d).
+- In the game: mesh and task shaders, bindless textures, pointers that shaders load from memory, occlusion queries,
+  and the game's embedded Lua (its error handling uses `setjmp`/`longjmp`, which the runtime now supports).
 
-Builds run with Windows Python and MSYS2 Clang (`tools/build_game.py`), the shader translator with .NET
-(`tools/build_xlate.py`); see the plan for the set-up.
+What doesn't work yet:
+
+- The level draws most of its geometry, but some is still missing. Where it's missing, the bright sky shows through
+  as white areas, and long white triangles cross the view. The game's culling pass still counts nothing, so its
+  mesh draws draw nothing; finding why is the current work (`docs/level.md`).
+- Two compute kernels are skipped by default because they write wrong values (`OOT_SKIP_CS=none` runs them).
+- Not yet tested beyond the first area. Only checked on NVIDIA; an AMD RX 9060 XT hangs after the title (#9).
+
+Contributors' work landed in #2, #4, #5, #10, #12 and #13 (and a cherry-pick from #7); thank you.
 
 This repository contains no game content. You need your own dump of the game and the keys from your own console. The
 content check (`tools/check_content.py`, run by the pre-commit hook and CI) keeps it that way.
+
+## Building
+
+The game runs into the first area with rendering faults (see Status). Commands are shown for Windows; from WSL the same
+scripts run (the build itself still uses Windows Python and MSYS2 through interop).
+
+Needs:
+
+- Python 3.14 or later for the extraction (its standard library reads zstd), and a Python 3.12 or later venv with
+  `tools/requirements.txt` for the generator and the build.
+- MSYS2 with the UCRT64 toolchain and the libraries the runtime builds against. The tools look for it in
+  `OOT_MSYS2`, then `toolchain/msys64` in the repository, then `C:\msys64`. In the MSYS2 UCRT64 shell:
+
+  ```
+  pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld \
+      mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-vulkan-headers \
+      mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-vulkan-memory-allocator mingw-w64-ucrt-x86_64-opus \
+      mingw-w64-ucrt-x86_64-libvpx mingw-w64-ucrt-x86_64-dav1d mingw-w64-ucrt-x86_64-openh264 \
+      mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-spirv-tools
+  ```
+
+  (gcc for `tools/build_zbic.py`; openh264 because the movie code includes its headers and the build copies its DLL;
+  shaderc and spirv-tools for `tools/build_shaders.py` and checking translated shaders.)
+- The .NET 10 SDK and the MSVC build tools for the shader translator.
+- A Vulkan GPU; the title screen's upscaler is fastest with `VK_KHR_cooperative_matrix` (recent NVIDIA, AMD or Intel).
+- About 30 GB free for the extracted RomFS, besides the dump.
+- Memory: the game commits about 21 GB on the level, so Windows needs that much free commit (RAM plus page file).
+
+Steps:
+
+1. Copy `config.example.toml` to `config.local.toml` and point `base` at your `.nup`.
+2. `python tools/build_zbic.py` builds the decoder for the Switch 2's compressed executables.
+3. `py -3.14 tools/extract_nup.py` extracts the ExeFS and RomFS to `build/extracted/v131072/` and checks every file
+   against the hash in the container. `tools/build_game.py` takes only a checked RomFS, so do not pass
+   `--no-verify`; to redo only the RomFS, add `--romfs-only`.
+4. `python recomp/gen.py --exefs build/extracted/v131072/exefs --out generated/v131072` lifts the game's code to C
+   (about a gigabyte of it).
+5. `python tools/build_xlate.py` builds the shader translator, then `python tools/build_game.py` compiles and links
+   `build/v131072/oot.exe`.
+6. Run `build\v131072\oot.exe`, or `python3 tools/run.py` from WSL, which also sets the environment and keeps the
+   window's focus (the game pauses without it).
 
 ## License
 

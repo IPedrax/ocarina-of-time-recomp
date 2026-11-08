@@ -48,6 +48,29 @@ class Module:
         self.lifter = Lifter(base, simd)
         self._cache = OrderedDict()
 
+    def plt_stubs(self):
+        """{stub address: imported symbol} for the module's PLT: ADRP x16 / LDR x17, [x16, #off] / ADD x16 / BR x17,
+        the GOT slot named by its JUMP_SLOT relocation. recomp/gen.py uses it for the calls that need more than a
+        call (setjmp: runtime/sjlj.c)."""
+        if hasattr(self, '_plt'):
+            return self._plt
+        n = self.nso
+        names = {i: s[0] for i, s in enumerate(n.syms)}
+        got = {off: names.get(sym) for off, typ, sym, _ in n.relocs if typ == 1026}   # R_AARCH64_JUMP_SLOT
+        img, (t0, tl) = self.image, n.text
+        self._plt = {}
+        for o in range(t0, t0 + tl - 12, 4):
+            w0, w1 = struct.unpack_from('<II', img, o)
+            if (w0 & 0x9f00001f) != 0x90000010 or (w1 & 0xffc003ff) != 0xf9400211:   # adrp x16 / ldr x17, [x16]
+                continue
+            imm = ((w0 >> 5) & 0x7ffff) << 2 | (w0 >> 29) & 3
+            imm -= (imm & 1 << 20) << 1                                                  # sign of the 21-bit page
+            page = (o & ~0xfff) + (imm << 12)
+            sym = got.get(page + ((w1 >> 10) & 0xfff) * 8)
+            if sym:
+                self._plt[self.base + o] = sym
+        return self._plt
+
     # ---- memory
 
     def in_text(self, a):

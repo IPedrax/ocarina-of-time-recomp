@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
@@ -104,11 +105,26 @@ static void counter_cb(void *arg) {
     free(addr);
 }
 
-// Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
-// and a samples-passed one as unknown.
-#define PENDING 256
+// The last report the replay queued to each address, with its fence: while the GPU has not finished it, the condition
+// of RENDER_COND reads a timestamp one as 0 and a samples-passed one as unknown (rendering). A table by address, not a
+// ring of the last 256 reports: OoT makes over 300 samples-passed reports a frame (one per tested object), the ring
+// dropped the oldest before their conditions were read, those conditions then read the word in memory (an older
+// count, often 0) and skipped the object, and whole objects (the Deku Tree's trunk, roots, branches) blinked out
+// frame after frame (2026-11-08, OOT_COND_LOG: "0 (1) vs 0 (1) -> skip" for an object reported in the same frame).
+// Replay thread only.
+#define PENDING 65536
 static struct { uint64_t addr, fence; int unknown; } pending[PENDING];
-static unsigned pending_head;
+static uint32_t pending_slot(uint64_t a) { return (uint32_t)((a >> 3) * 0x9e3779b97f4a7c15ull >> 48) & (PENDING - 1); }
+static void pending_set(uint64_t addr, uint64_t fence, int unknown) {
+    uint32_t i = pending_slot(addr), k = 0;
+    while (pending[i].addr && pending[i].addr != addr && ++k < PENDING) i = (i + 1) & (PENDING - 1);
+    if (k == PENDING) {
+        static int said;
+        if (!said) said = 1, rt_log("vk: report table full: conditions on new report addresses read memory");
+        return;
+    }
+    pending[i].addr = addr, pending[i].fence = fence, pending[i].unknown = unknown;
+}
 
 // ---- occlusion counts (samples passed)
 //
@@ -274,8 +290,24 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
     vk_completion_add(ex->fence, event_cb, e);
 }
 
+// OOT_COND_LOG=<frame> (diagnostic): from that frame on, the first 400 conditional-render evaluations (address, the
+// two counter words, how each was read, the result) and the counter reports, for finding objects that flicker.
+static int cond_log_on(void) {
+    static int64_t from = -2;
+    static volatile LONG n;
+    if (from == -2) {
+        const char *e = cfg_get("OOT_COND_LOG");
+        from = e && *e ? (int64_t)strtoull(e, NULL, 10) : -1;
+    }
+    if (from < 0 || (int64_t)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < from) return 0;
+    return InterlockedIncrement(&n) <= 400;
+}
+
 static void report_counter(VkExec *ex, const p_report_counter *p) {
     int samples = p->type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_ready();
+    if (cond_log_on())
+        rt_log("cond: frame %llu report type %u at %#llx (fence %llu)", (unsigned long long)gfx_counters.frames, p->type,
+               (unsigned long long)p->addr, (unsigned long long)ex->fence);
     if (nvn_gpu_only(p->addr)) {   // CPU-invisible pool: no host memory behind it
         if (samples) oq_report(ex, 0);
         return;
@@ -291,7 +323,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         *a = p->addr;
         vk_completion_add(ex->fence, counter_cb, a);
     }
-    pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};
+    pending_set(p->addr, ex->fence, samples);
 }
 
 // ---- conditional rendering
@@ -299,10 +331,9 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
 // 1: *v read, 0: not readable, 2: a samples-passed report not done yet (unknown)
 static int counter_word(uint64_t addr, uint64_t *v) {
     uint64_t done = vk_sync_fence_done();
-    for (unsigned k = 1; k <= PENDING; k++) {   // newest first: the last report to addr decides
-        unsigned i = (pending_head - k) % PENDING;
-        if (pending[i].addr == addr && pending[i].fence > done) return *v = 0, pending[i].unknown ? 2 : 1;
-    }
+    uint32_t i = pending_slot(addr), k = 0;   // the last report to addr decides
+    while (pending[i].addr && pending[i].addr != addr && ++k < PENDING) i = (i + 1) & (PENDING - 1);
+    if (k < PENDING && pending[i].addr == addr && pending[i].fence > done) return *v = 0, pending[i].unknown ? 2 : 1;
     VkMemSpan m;
     if (nvn_gpu_only(addr) || !vk_mem_resolve(addr, sizeof *v, &m)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);
@@ -311,14 +342,24 @@ static int counter_word(uint64_t addr, uint64_t *v) {
 }
 
 static int cond_enabled(const p_render_cond *c) {
+    static int always = -1;   // OOT_COND_RENDER=1 (diagnostic): every conditional render renders
+    if (always < 0) {
+        const char *e = cfg_get("OOT_COND_RENDER");
+        always = e && *e == '1';
+        if (always) rt_log("vk: OOT_COND_RENDER=1: conditional rendering always renders");
+    }
+    if (always) return 1;
     uint64_t x, y;
     int rx = counter_word(c->addr, &x), ry = counter_word(c->addr + 16, &y);
     if (!rx || !ry) {
         warn_once(W_BUFFER, "conditional render counters at %#llx are not readable: rendering", (unsigned long long)c->addr);
         return 1;
     }
-    if (rx == 2 || ry == 2) return 1;   // a samples-passed count not done yet
-    return c->mode == 0 ? x == y : x != y;
+    int res = rx == 2 || ry == 2 ? 1 : c->mode == 0 ? x == y : x != y;
+    if (cond_log_on())
+        rt_log("cond: frame %llu at %#llx mode %d: %llu (%d) vs %llu (%d) -> %s", (unsigned long long)gfx_counters.frames,
+               (unsigned long long)c->addr, c->mode, (unsigned long long)x, rx, (unsigned long long)y, ry, res ? "render" : "skip");
+    return res;
 }
 
 // ---- textures

@@ -1,0 +1,66 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -74,6 +74,8 @@
+             private readonly List<Entry> _entries;
+             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
+             private readonly HelperFunctionManager _hfm;
++
++            public ShaderStage Stage { get; init; }
+ 
+             public GtsContext(HelperFunctionManager hfm)
+             {
+@@ -213,9 +215,10 @@
+             BasicBlock[] blocks,
+             ResourceManager resourceManager,
+             IGpuAccessor gpuAccessor,
+-            TargetLanguage targetLanguage)
+-        {
+-            GtsContext gtsContext = new(hfm);
++            TargetLanguage targetLanguage,
++            ShaderStage stage = ShaderStage.Compute)
++        {
++            GtsContext gtsContext = new(hfm) { Stage = stage };
+ 
+             foreach (BasicBlock block in blocks)
+             {
+@@ -657,7 +660,28 @@
+ 
+             if (targetCbs.Count == 0)
+             {
+-                gpuAccessor.Log($"Failed to find storage buffer for global memory operation \"{operation.Inst}\".");
++                // ocarina-of-time-recomp: an address with no traceable base (a pointer loaded from memory, as the
++                // level's fog kernel reads its light data through) is looked up at run time in every entry of the
++                // stage's storage table in the driver constant buffer (16-byte {address, size} entries at byte 0x110
++                // vertex, 0x510 fragment, 0x310 compute; the host binds the buffers the pointers lead to there).
++                // Upstream gave up here, and the access read 0.
++                int tableWord = gtsContext.Stage switch
++                {
++                    ShaderStage.Vertex => 0x110 / 4,
++                    ShaderStage.Fragment => 0x510 / 4,
++                    ShaderStage.Compute => 0x310 / 4,
++                    _ => -1,
++                };
++
++                for (int slot = 0; tableWord >= 0 && slot < 16; slot++)
++                {
++                    targetCbs.Add(PackCbSlotAndOffset(DriverReservedCb, tableWord + slot * 4));
++                }
++
++                if (targetCbs.Count == 0)
++                {
++                    gpuAccessor.Log($"Failed to find storage buffer for global memory operation \"{operation.Inst}\".");
++                }
+             }
+ 
+             if (gtsContext.TryGetFunctionId(operation, isMultiTarget: true, targetCbs, out functionId))
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+@@ -18,7 +18,7 @@
+ 
+             // TODO: Some of those are not optimizations and shouldn't be here.
+ 
+-            GlobalToStorage.RunPass(context.Hfm, context.Blocks, context.ResourceManager, context.GpuAccessor, context.TargetLanguage);
++            GlobalToStorage.RunPass(context.Hfm, context.Blocks, context.ResourceManager, context.GpuAccessor, context.TargetLanguage, context.Stage);
+ 
+             bool hostSupportsShaderFloat64 = context.GpuAccessor.QueryHostSupportsShaderFloat64();
+ 

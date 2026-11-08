@@ -45,7 +45,8 @@ typedef struct VkCtx {
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker, has_nv_checkpoints,
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
-        has_coopmat;                        // VK_KHR_cooperative_matrix (compute; --probe-coopmat)
+        has_coopmat,                        // VK_KHR_cooperative_matrix (compute; --probe-coopmat)
+        has_mesh_shader;                    // VK_EXT_mesh_shader with task and mesh stages (docs/mesh.md)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. OOT_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -228,6 +229,12 @@ const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
 void vk_headroom_start(void);
 void vk_headroom_stop(void);   // before vmaDestroyAllocator
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// The pointer table (vk_memory.c, docs/pointers.md): the storage buffer shaders read to turn a GPU address into a
+// device address. 0 when it is off.
+int vk_mem_ptr_table(VkBuffer *buf, VkDeviceSize *size);
+// Its device address, which the support buffer hands to shaders at byte 1408 (vk_exec_draw.c support_fill), so a
+// shader can read the table through a pointer without a storage binding; 0 when it is off.
+uint64_t vk_mem_guest_pages(void);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);
@@ -321,6 +328,8 @@ void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 VkSampler vk_sampler_by_id_locked(int id);
+// The same for pool-indexed sampling: NULL when no live texture object has the slot's storage (a stale pool entry).
+const VkTexImage *vk_texture_live_by_id_locked(int id, view_t *view, int *has_view);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler, and MacNativeGames samples it the same way. VK_NULL_HANDLE
 // for an empty slot.
@@ -366,6 +375,12 @@ void flip_rows(uint8_t *px, uint32_t w, uint32_t h);   // boot.c: reverses the r
 // Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
+// OOT_FENCE_TRACE=1 (vk_sync.c's watchdog): the step the submit path is in (vk_sync.c, op_dispatch, compute_create)
+// and the op the replay is on (vk_exec.c walk), so a stall names where it is stuck. vk_trace_stage costs a load when off.
+void vk_trace_stage(int s);
+int vk_trace_enabled(void);
+extern int vk_exec_trace_on;
+extern volatile long long vk_exec_cur_op, vk_exec_cur_fence;
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
@@ -457,7 +472,10 @@ typedef struct {
     // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
+    // GFX_POOL_* bindings (bit per binding) the shaders index: the replay binds its pool set at GFX_POOL_SET (gfx.h).
+    uint32_t pool_mask;
 } VkPipeInfo;
+VkDescriptorSetLayout vk_pipeline_pool_layout(void);   // the pool set's layout; VK_NULL_HANDLE without descriptor indexing
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
 typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBufferView view; uint64_t w[3]; } VkDescSlot;
@@ -477,6 +495,8 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 // No-op without vk_pipeline_async_enable, with OOT_PIPE_PREBUILD=0 or with OOT_GPU=null.
 void vk_pipeline_prewarm(void);
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+// A task (may be NULL) + mesh + fragment (s->fs) pipeline for the bound state (docs/mesh.md); built synchronously.
+VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const GfxShader *ms, const VkPipeInfo **info);
 // Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
 // topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU
 // has them dynamic, depth clamp, polygon mode, blend enables, equations, write masks and alpha to coverage. The replay

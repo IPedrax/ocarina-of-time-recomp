@@ -40,11 +40,18 @@ static class SwshXlate
         // 全部资源放进第 0 组，各占不同绑定号（spirv-cross 出成一个参数缓冲）；常量段号 index 的缓冲由翻译器给 binding = index+1 的惯例不依赖
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
         public SetBindingPair CreateConstantBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count == TexturePoolLength ? 1 : count; return new(0, b); }
         public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        // A pool array (count TexturePoolLength or SamplerPoolLength, see below) takes one binding number like any array
+        // in Vulkan: advanced by its count, the bindings after it passed 65535 and the host's 16-bit binding fields.
+        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count == TexturePoolLength || count == SamplerPoolLength ? 1 : count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
-        public int QuerySamplerArrayLengthFromPool() => 32;
+        // Pool-indexed (bindless) samples: BindlessElimination turns a handle loaded from a constant buffer into an
+        // index into arrays that stand for the bound texture and sampler pools. The host keeps one descriptor set per
+        // pool with these lengths (runtime/vk_exec_draw.c pool sets; OoT's pools hold 33068 textures and 4096
+        // samplers). At 32, every texture id above 31 was clamped to 31.
+        public const int TexturePoolLength = 65536, SamplerPoolLength = 4096;
+        public int QuerySamplerArrayLengthFromPool() => SamplerPoolLength;
         // Texture arrays whose handles a user uniform block holds: element k is the handle at byte 8 k of the block
         // (Ryujinx sizes them by the bound block, size / 8; this offline translator cannot see it). Uniform block 3
         // (NVN slot 0) of this game's fog and light-list passes holds up to 32 records of 144 bytes, each with a
@@ -53,7 +60,28 @@ static class SwshXlate
         // The other blocks' arrays (about 4900 shaders, material tables) stay at 32: each element is a descriptor
         // written at every draw.
         public int QueryTextureArrayLengthFromBuffer(int slot) => slot == 3 ? 1024 : 32;
-        public int QueryTextureArrayLengthFromPool() => 32;
+        public int QueryTextureArrayLengthFromPool() => TexturePoolLength;
+        // A pool index comes from data and can differ across a subgroup, which wants the NonUniform decoration (Ryujinx
+        // CodeGen/Spirv/Instructions.cs MarkNonUniform). Off for now: with it, the level route on the RTX 4070 lost the
+        // device in two of six runs (one with every pool-indexing pipeline skipped, OOT_POOL_SKIP=1, so through the
+        // other indexed arrays it decorates) and hung the GPU in two more; off, it ran clean (docs/bindless.md).
+        // Ryujinx decorates the access chain only, not the load from it.
+        public bool QueryHostSupportsShaderNonUniformIndexing() => false;
+        // The translator's own messages (an unresolved bindless handle, for one) go into the .res.json notes.
+        public void Log(string message) => Notes.Add(message);
+        // Task ("ts") and mesh ("ms") programs, translated as compute (docs/mesh.md): the job's "mesh" object carries
+        // what the program header and control section said (runtime/gfx_shader.c): "max_vertices", "max_primitives",
+        // "lines" (each output line's target: 0-3 position x-w, 4 + location * 4 + component, -1 none), "base" (the
+        // stage buffer's byte offset in shared memory, "shared" covering it), "payload_words".
+        JsonObject Mesh => _job["mesh"] as JsonObject;
+        int MeshInt(string name) => Mesh?[name] is JsonNode n ? (int)n : 0;
+        public int QueryMeshStage() => (string)_job["stage"] == "ts" ? 1 : (string)_job["stage"] == "ms" ? 2 : 0;
+        public int QueryMeshMaxVertices() => MeshInt("max_vertices");
+        public int QueryMeshMaxPrimitives() => MeshInt("max_primitives");
+        public int QueryMeshOutputLines() => Mesh?["lines"] is JsonArray a ? a.Count : 0;
+        public int QueryMeshOutputLine(int line) => Mesh?["lines"] is JsonArray a && line < a.Count ? (int)a[line] : -1;
+        public int QueryMeshBufferBase() => MeshInt("base");
+        public int QueryTaskPayloadWords() => MeshInt("payload_words");
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
         // 槽号 | the host's c2 slot of a handle (gfx_shader.c handle_slot): combined texture+sampler handles at bytes
@@ -153,7 +181,7 @@ static class SwshXlate
                 var acc = new Accessor(code, job);
                 // 作业 debug = false：关 DebugMode（DebugMode 会跳过 AST 优化器，产物满是临时变量；不改语义）
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
-                var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
+                var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] is "cs" or "ts" or "ms" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), p.BinaryCode);

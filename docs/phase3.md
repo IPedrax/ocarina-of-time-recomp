@@ -296,6 +296,135 @@ Open, in order:
   quick route (`tools/run.py --replay build/logs/a-spam.txt --skip-movies`) reaches the level in about 75 s.
   The game has no button to skip the opening (the user).
 
+## Status (2026-11-06, evening): the level's programs lower, the scene is still black
+
+Worked offline: the cache keeps every refused program as `<key>.fail.ctl` / `.fail.code`, and lowering those (and the
+stored inputs `in/*.in`, to catch regressions) with `build/tools/sm86_lower` takes seconds, against minutes per game
+run. Of the 64 translation keys the level route refused (28 distinct programs), 62 lower now (commits 73ea4d7,
+913bbfb): IMAD.WIDE and uniform-base loads with less scratch (the six vertex shaders near R255), PLOP3 and UPLOP3
+over any PSETP-computable table (and a fix: the outer PSETP slot held the wrong input), RED and ATOMG on odd uniform
+pairs, PLOP3 against swapped uniform predicates through registers, indexed IPA, FCHK (always the fast path), TLD with
+texel offsets, LEA with a negated addend, stores of wide zeros, IABS with constant operands. The water renders now
+(`build/logs/level-lower2.png`, run 359); the rest of the geometry is still flat black or white.
+
+Left on the route: a fragment shader's TEX with bit 60 clear (NAK's `.scr`; its operand layout is not known here) and
+an unknown opcode 0x19f in a compute kernel.
+
+**Then the frame dump** (`--dump 900`, `build/logs/dump-361`): the level is a forward renderer. Pass 136 is a depth
+prepass (217 draws, colour masked: `chmask 0`) that covers the whole view; pass 168 is the colour pass (112 draws,
+depth EQUAL without a write) into the r11g11b10f HDR target, and its draws look right where they land (bark and
+moss textured, `pass_0168_t0_..._tm.png`), but most of the scene, the ground among it, is missing there. Relaxing
+EQUAL to LEQUAL changed nothing visible, so it is not depth invariance. The missing geometry is drawn with **mesh
+shaders**: the run calls `nvnCommandBufferDrawMeshTasksIndirect` thousands of times (a stub; `nvn_procs.c` now logs a
+stub's call count at powers of two) and the game's programs come in four stage sets by control byte +0x56 (now logged
+once each by `nvn_api_obj.c prog_set_shaders`): vertex + fragment (0 1), compute (5), and **7 + fragment** and
+**6 + 7 + fragment**: mesh (7) and task (6) programs. So the next piece is the mesh stages, not more of the lowering.
+Neither the translator (Ryujinx 1.3.2 has no mesh or task stage) nor the replay supports them today; the two ways are
+VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the translator) or running task and mesh
+programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
+hand-off for it.
+
+## Status (2026-11-08, evening): the flickering level and the occlusion counts
+
+**Measuring flicker without a person.** `OOT_SHOTS=2390-2405:1 OOT_SHOTS_FULL=1 OOT_SHOTS_DIR=...` on the level
+route (`--replay build/logs/a-spam.txt --skip-movies`, 75 s) saves 16 consecutive presents; the share of pixels that
+change by more than 0.3 from one frame and come back the next (an A-B-A pattern) measures the flicker: 10-30% before
+the fix, 0.2-0.6% after.
+
+**Cause: conditional renders on occlusion counts** (`vk_exec_xfer.c`). OoT tests objects with samples-passed reports
+(over 300 a frame, from `main+0x759ac` and `main+0x75ecc` in pairs 0x20 apart, and `main+0x65f44`) and draws them
+under `SetRenderEnableConditional` (mode 1, the counter at addr against the word at addr+16). The replay evaluates the
+condition on the CPU when it records the op: a report of the same submission not done yet counts as unknown and
+renders. Those reports were kept in a ring of the last 256; the oldest fell out before their conditions were read, which
+then read guest memory (an older count, mostly 0) and skipped the object, so whole objects (the Deku Tree's trunk,
+roots, branches) vanished in some frames. The pre-merge build `aa53891` did the same. Now a table by address (65536
+entries). Found with `OOT_COND_LOG=<frame>` (evaluations and reports); `OOT_COND_RENDER=1` (render every condition)
+gives a stable but white picture, as the game also gates full-screen passes so.
+
+**The frame rate it cost.** The level ran at about 57 fps because the bug culled objects that should have been drawn;
+with every unknown count rendering, almost nothing is culled and the level runs at 35-38 fps, CPU-bound (`--trace perf`:
+28 ms a frame, GPU 17 ms; not the pointer table: `OOT_GPU_POINTERS=0` gives 38.5). Using the previous frame's count of
+the same address when this frame's is unknown brought 49 fps back but the flicker too: an object drawn in frame N
+occludes its own proxy, its count is 0, it is culled in N+1, and so on (a two-frame oscillation). The console avoids
+it by comparing in GPU order within the frame. Next: evaluate these conditions on the GPU
+(`VK_EXT_conditional_rendering`, available on the test machine): copy each report's query result into a buffer slot
+outside the render pass and wrap the conditional draws in begin/end; first establish what the word at addr+16 holds on
+the console (here it reads 0, so with cumulative counts the condition would always pass, which cannot be the intent).
+
+**Kernels.** `ace1cec0` now takes 0.025 ms (its loop bounds come from the uniform table, main's fcb2936) and its
+black-and-white blocks are gone at frame 2400, but with nothing skipped (`OOT_SKIP_CS=none`) a later scene of the
+`a-spam-long` route (frame ~4880) is black but for Navi, so `ace1cec0` and `3f15911a` stay skipped by default.
+
+## Status (2026-11-07): the level's frame rate is one kernel
+
+`OOT_CS_TIME=1` on the level route (run 398): one compute kernel, input id `ace1cec038d64d1f` (code hash
+`80fb2f9325762992`, 8x8 threads over 64x64 groups: one thread per pixel of a 512x512 target), takes 1578 ms of GPU
+time per dispatch, 99.9% of the frame's compute; everything else is below 0.4 ms. Skipping it
+(`OOT_SKIP_CS=1a62084a,ace1cec0`, run 405) takes the GPU from about 450 ms to 10.5 ms a frame: 58 fps in the first
+minute, the replay script reaches a cutscene (a Kokiri and Navi, textured and lit, `build/logs/level-noace.png`), the
+background dark. Its first loop (0x900-0xcf0) runs over 0x30-byte records of the storage buffer at bank 0 + 0x60
+(NVN2 table slot 0; in the dump `build/logs/dump-ace`, 0x18040 bytes: a 0x40-byte header and room for 2048
+records), sampling a texture each, up to the count at the buffer's + 4 (`LD R3, [UR4 + 0x4]`); later loops are
+bounded by word 0 of uniform blocks 4-7, zero in the dump. Two of its four textures resolve to the 4x4 default
+texture (bank 0 + 0x80, + 0x88). Next: the count it reads (the readback `OOT_CS_READBACK=<frame>,all,dims=64x64x1`
+did not catch its buffer, so it may not go through `ssbo_info`), and whether its record buffer and textures are the
+right ones. Until then, `OOT_SKIP_CS=1a62084a,ace1cec0` gives a playable frame rate on the level for testing.
+
+## Status (2026-11-06, the start-up crash): two host threads on one fiber stack
+
+The death right after the first frame (about one run in two: an access violation executing a heap or guest address,
+or in `kern_fiber_finalize`, often on two host threads at once) was not the SDK abort in MultiWait, nor the
+asynchronous preemption (`OOT_ASYNC_PREEMPT=0`: 4 of 10 runs died, against 2 of 10 with it). Every dump had the same
+guest stack: `nn::os` waits (`obs_ev_trywait`, `InternalWaitAnyImpl`) down to a `WaitSynchronization` (SVC 0x18)
+whose return landed on garbage. `OOT_FIBER_LOG=1` (new: a line per InitializeFiber, FinalizeFiber, SwitchToFiber
+and fiber return, with guest and host thread) showed the pattern before each death: SDK 22's `nn::async` coordinator
+yields a fiber with `SwitchToFiber(nullptr)` on one worker, another worker picks it up, and the fiber returns there.
+`fiber_main` then switched to the base fiber of the thread it had *started* on: clang took the address of the
+thread-local `tcur` once at entry and kept it in a callee-saved register across `rt_call` (LLVM treats a
+thread-local's address as fixed within a function). That base fiber was already running on its own thread, so two
+host threads ran one stack. `kernel.c` now reads `tcur` after a switch only through the out-of-line `tcur_now()`
+(in `fiber_main` and after `SwitchToFiber` in `fiber_switch_to`, which also wrote the context's host depth into the
+thread it had left). Result: 20 runs of 12 s, none died (before: 8 of 12, 2 of 10, 4 of 10 in three series).
+
+Also: the SDK's argument-less `nn::diag::detail::AbortImpl()` (the one `InternalWaitAnyImpl` calls) gets an observer
+in `ov_oot.c` that, for the MultiWait abort, lists the holders by vtable; the observer on the four-argument overload
+never fired because the SDK does not call that one there. Left as is: `hostfn_tracked` and `rt_original` keep the
+thread they started on across a call that can move a fiber (`c->thread` before the call), so with asynchronous
+preemption on the host depth of a moved fiber is counted on the wrong thread.
+
+## Status (2026-11-06, the mesh stages measured): the level's scene is drawn by mesh tasks
+
+With the start-up crash gone, the quick route (`--replay build/logs/a-spam.txt --skip-movies`, 110 s) reaches the
+Deku Tree's dialogue over a black scene every time. Measured on the way:
+- The NVN2 stubs now log their call count at 10, 100, 1,000... (`nvn_procs.c` NVN_STUB). In about 40 s of the level
+  the game made 10,000 to 99,999 `nvnCommandBufferDrawMeshTasksIndirect` and 1,000 to 9,999
+  `nvnCommandBufferDrawMeshTasks` calls (run-85), so at least about ten mesh draws a frame, against about 100
+  ordinary draws.
+- The frame dump of frame 2000 (dump-84) has no scene pass at all: 59 dispatches and 86 render passes, the largest
+  960x540 (10 passes, 36 draws), then the 2560x1440 composition with the subtitles. The mesh draws, being stubs, do
+  not reach the dump; everything the scene is made of goes through them.
+- 110 distinct programs fail to lower in the level (51,824 log lines, the same programs retried): unknown opcodes
+  57, scratch pressure 17, `RED address` 10, uniform datapath opcodes 8, `PLOP3` 6, and smaller groups.
+- The corpus holds 12 mesh-pipeline programs, 9 mesh and 3 task, all from the agl package
+  (`ApplicationPackage.Nin_Ounce_NVN2.release.sarc.zs/AglShader.sharcb`), 16 to 616 instructions: a few generic
+  mesh programs feed the materials' thousands of pixel shaders. None lowers: the stages write their outputs (and the
+  task stage its payload) with `ISBEWR` and read their inputs with `ISBERD`, whose immediates are undocumented. The
+  smallest mesh program, 28b308906146a98b (112 instructions, workgroup 32), reads `ISBERD [0x0]`, writes
+  `ISBEWR 0x3ff` and `0x30a` (likely the vertex and primitive counts), then per vertex `0x4`/`0x6`, `0x8012`/`0x8018`,
+  `0x100ff`, `0x18014`, `0x20000`/`0x20008`, `0x28001`/`0x28009` (an attribute word address with what may be a
+  component in bits 15-17) and per primitive `0x40d`, `0x505`, `0x607`, `0x707`, `0x805`, `0x90f`, `0x8002`, `0x3`,
+  `0x1000a`, `0x1800b`. The task program 9d61d62aa9337355 (16 instructions) writes `0x1001` and `0x400`.
+
+What the mesh stages need, in order: decode the `ISBEWR`/`ISBERD` address encoding from these programs and what the
+game draws with them; lower them (`sm86_lower.c`) to an output form the translator can take; a translator patch for
+SPIR-V's `MeshEXT`/`TaskEXT` execution models (per-vertex and per-primitive output arrays, `SetMeshOutputsEXT`, the
+task payload, `EmitMeshTasksEXT`), which Ryujinx 1.3.2 lacks; and on the host `VK_EXT_mesh_shader` pipelines with
+task and mesh stages and `vkCmdDrawMeshTasks*EXT` for the eight NVN2 entry points, still stubs. The first step is the
+uncertain one.
+
+Also fixed: `tools/shader_census.py --lower` lowered nothing when the repository's path held a space (the helper's
+batch request is split at spaces); it now passes paths relative to the output folder.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485

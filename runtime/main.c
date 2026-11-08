@@ -671,7 +671,8 @@ static void check_memory(void) {
     CHECK(q.state == 0 && q.base == g->alias.base && q.size == g->alias.size, "QueryMemory on the free alias region");
     CHECK(mem_map_physical(a, 0x1000) == 0 && LD64(a + 0x10) == 0 && mem_unmap_physical(a, 0x1000) == 0,
           "remapped physical memory is not zeroed");
-    CHECK(mem_map_physical(a, 0x100000000ull) == 0x10801, "MapPhysicalMemory beyond the pool is not LimitReached");
+    mem_info(6, &v);   // the pool (9.6 GiB on the Switch 2), so the request below exceeds it whatever its size
+    CHECK(mem_map_physical(a, v + 0x10000) == 0x10801, "MapPhysicalMemory beyond the pool is not LimitReached");
     mem_query(RT_HOSTFN_BASE + 0x40, &q);
     CHECK(q.state == 0x10 && q.base == RT_HOSTFN_BASE, "QueryMemory on the host-function window");
     mem_query(g->alias.base + g->alias.size + 0x1000, &q);
@@ -768,6 +769,8 @@ static void portable_paths(RtConfig *c) {
     c->profile = portable_path(exe, "OOT_PROFILE_DIR", "profile", ".", pp_profile, sizeof pp_profile, c->profile);
 }
 
+void watch_start(void);   // watch.c
+
 int main(int argc, char **argv) {
     mem_init();   // first: claim the guest address space before anything else can land there; reads oot.ini
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -775,6 +778,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     AddVectoredExceptionHandler(0, crash_handler);
 #endif
+    watch_start();   // OOT_WATCH_WRITE (watch.c), diagnostic
     parse_trace();
     prof_start();
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait

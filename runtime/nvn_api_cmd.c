@@ -438,6 +438,45 @@ NVN_API(nvnCommandBufferCopyCommands) {
     for (int i = 0; i < n; i++) inline_recording(o, h[i], "CopyCommands");
 }
 
+// OOT_GPU_WATCH=<addr>,<len>[;<addr>,<len>...] (diagnostic, docs/mesh-tracker.md 2026-11-08): log every recorded
+// command whose destination overlaps a watched GPU address range, with the frame and the guest caller, to find what
+// writes a buffer no bound kernel writes (the level's indirect dispatch records). Covers the commands that name a
+// destination address: CopyBufferToBuffer, ClearBuffer, ReportValue, ReportCounter, UpdateUniformBuffer,
+// CopyTextureToBuffer. Kernel stores through bound buffers are not seen here (frame dumps list those bindings).
+// OOT_GPU_WATCH_FROM=<frame> starts it at that frame; at most 256 lines a run.
+#define GW_N 8
+static struct { int on; uint64_t from; int n; volatile LONG logged; uint64_t lo[GW_N], hi[GW_N]; } GW;
+static INIT_ONCE gw_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK gw_init(PINIT_ONCE once, void *param, void **ctx) {   // once: command buffers record on several threads
+    (void)once, (void)param, (void)ctx;
+    const char *e = cfg_get("OOT_GPU_WATCH");
+    for (const char *p = e; p && *p && GW.n < GW_N;) {
+        char *q;
+        uint64_t a = strtoull(p, &q, 0), l = *q == ',' ? strtoull(q + 1, &q, 0) : 0;
+        if (q == p || !l) break;
+        GW.lo[GW.n] = a, GW.hi[GW.n] = a + l, GW.n++;
+        p = *q == ';' ? q + 1 : q;
+        if (*q != ';') break;
+    }
+    const char *f = cfg_get("OOT_GPU_WATCH_FROM");
+    GW.from = f && *f ? strtoull(f, NULL, 10) : 0;
+    GW.on = GW.n > 0;
+    if (GW.on) rt_log("nvn: GPU watch on %d range(s) from frame %llu (OOT_GPU_WATCH)", GW.n, (unsigned long long)GW.from);
+    return TRUE;
+}
+static void gpu_watch(Cpu *c, const char *what, uint64_t dst, uint64_t size, uint64_t extra) {
+    InitOnceExecuteOnce(&gw_once, gw_init, NULL, NULL);
+    if (!GW.on || GW.logged >= 256 || gfx_stats().frames < GW.from) return;
+    for (int i = 0; i < GW.n; i++)
+        if (dst < GW.hi[i] && dst + (size ? size : 1) > GW.lo[i]) {
+            if (InterlockedIncrement(&GW.logged) > 256) return;
+            rt_log("nvn: GPU watch: frame %llu %s to %#llx+%#llx (%#llx) from main+%#llx",
+                   (unsigned long long)gfx_stats().frames, what, (unsigned long long)dst, (unsigned long long)size,
+                   (unsigned long long)extra, (unsigned long long)(c->x[30] - 0x7000000000ull));
+            return;
+        }
+}
+
 // ---------- CommandBuffer: commands with CPU-visible results (performed by the back end in GPU order)
 // void nvnCommandBufferSignalEvent(NVNcommandBuffer *cmd, const NVNevent *event, NVNeventSignalMode mode,
 // NVNeventSignalLocation location, int flags, uint32_t value)
@@ -449,11 +488,13 @@ NVN_API(nvnCommandBufferSignalEvent) {
 NVN_API(nvnCommandBufferResetCounter) { REC(cmd_of(c), OP_RESET_COUNTER, p_reset_counter)->type = (uint32_t)arg_x(c, 1); }
 // void nvnCommandBufferReportCounter(NVNcommandBuffer *cmd, NVNcounterType type, NVNbufferAddress address)
 NVN_API(nvnCommandBufferReportCounter) {
+    gpu_watch(c, "ReportCounter", arg_x(c, 2), 16, arg_x(c, 1));
     *REC(cmd_of(c), OP_REPORT_COUNTER, p_report_counter) = (p_report_counter){(uint32_t)arg_x(c, 1), arg_x(c, 2)};
 }
 // void nvnCommandBufferCopyBufferToBuffer(NVNcommandBuffer *cmd, NVNbufferAddress src, NVNbufferAddress dst,
 // size_t size, int flags)
 NVN_API(nvnCommandBufferCopyBufferToBuffer) {
+    gpu_watch(c, "CopyBufferToBuffer", arg_x(c, 2), arg_x(c, 3), arg_x(c, 1));
     *REC(cmd_of(c), OP_COPY_B2B, p_copy_b2b) = (p_copy_b2b){arg_x(c, 1), arg_x(c, 2), arg_x(c, 3)};
 }
 // void nvnCommandBufferUpdateUniformBuffer(NVNcommandBuffer *cmd, NVNbufferAddress buffer, size_t buffer_size,
@@ -463,6 +504,7 @@ NVN_API(nvnCommandBufferUpdateUniformBuffer) {
     uint64_t dst = arg_x(c, 1) + arg_x(c, 3), n = arg_x(c, 4);
     const void *data = arg_p(c, 5);
     if (n > (16u << 20)) rt_fatal("nvn: UpdateUniformBuffer of %#llx bytes", (unsigned long long)n);
+    gpu_watch(c, "UpdateUniformBuffer", dst, n, n >= 4 ? *(const uint32_t *)data : 0);
     p_update_ub *r = rec(cmd_of(c), OP_UPDATE_UB, offsetof(p_update_ub, data) + n);
     r->dst = dst;
     r->size = n;
@@ -674,6 +716,36 @@ static void draw_trace(Cpu *c, const char *what) {
     rt_log("nvn: %s under program %llu from %s at frame %llu", what, (unsigned long long)serial, ldr_describe(lr, buf, sizeof buf),
            (unsigned long long)frame);
 }
+// DIAG, for the stubbed mesh draws (nvn_procs.c NVN_STUB): each program first drawn with a mesh entry point is logged
+// once, stage by stage, with the FNV-1a hash of the stage's control section (the census's ctl/<key>.ctl, its size at
+// +0xd4) and its stage byte (+0x56: 6 task, 7 mesh), so the mesh programs the game uses can be told apart.
+void nvn_diag_mesh_draw(const char *entry) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static uint64_t seen[64];
+    static int nseen;
+    const prog_t *p = bound_prog;
+    if (!p) return;
+    AcquireSRWLockExclusive(&lock);
+    int known = 0;
+    for (int i = 0; i < nseen && !known; i++) known = seen[i] == p->serial;
+    if (!known && nseen < 64) seen[nseen++] = p->serial;
+    ReleaseSRWLockExclusive(&lock);
+    if (known || nseen >= 64) return;
+    char line[512];
+    int o = snprintf(line, sizeof line, "nvn2 mesh draw (%s): program %llu,", entry, (unsigned long long)p->serial);
+    for (uint32_t i = 0; i < p->nstage && i < 6 && o < (int)sizeof line - 48; i++) {
+        const uint8_t *ctl = p->sd[i].control;
+        if (!ctl) continue;
+        uint32_t size;
+        memcpy(&size, ctl + 0xd4, 4);
+        if (size > 0x1000) size = 0xe0;
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t k = 0; k < size; k++) h = (h ^ ctl[k]) * 0x100000001b3ull;
+        o += snprintf(line + o, sizeof line - o, " stage %u ctl %016llx", ctl[0x56], (unsigned long long)h);
+    }
+    rt_log("%s", line);
+}
+
 NVN_API(nvnCommandBufferBindProgram) {
     bound_prog = arg_p(c, 1);
     *REC(cmd_of(c), OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){arg_p(c, 1), (int)arg_x(c, 2)};
@@ -918,8 +990,19 @@ NVN_API(nvnCommandBufferDispatchCompute) {
 NVN_API(nvnCommandBufferDispatchComputeIndirect) {
     *REC(cmd_of(c), OP_DISPATCH_IND, p_dispatch_ind) = (p_dispatch_ind){arg_x(c, 1), c->x[30]};
 }
+// Mesh tasks (docs/mesh.md, from the game's calls; not in nvn.h): void nvnCommandBufferDrawMeshTasks(NVNcommandBuffer
+// *cmd, int first, int count) and void nvnCommandBufferDrawMeshTasksIndirect(NVNcommandBuffer *cmd, NVNbufferAddress
+// indirect), the record GPU-written. Recorded for the replay, which does not draw them yet (vk_exec_draw.c
+// op_draw_mesh).
+NVN_API(nvnCommandBufferDrawMeshTasks) {
+    *REC(cmd_of(c), OP_DRAW_MESH, p_draw_mesh) = (p_draw_mesh){(uint32_t)arg_x(c, 1), (uint32_t)arg_x(c, 2), 0, c->x[30]};
+}
+NVN_API(nvnCommandBufferDrawMeshTasksIndirect) {
+    *REC(cmd_of(c), OP_DRAW_MESH, p_draw_mesh) = (p_draw_mesh){0, 0, arg_x(c, 1), c->x[30]};
+}
 // void nvnCommandBufferClearBuffer(NVNcommandBuffer *cmd, NVNbufferAddress addr, size_t size, uint32_t value)
 NVN_API(nvnCommandBufferClearBuffer) {
+    gpu_watch(c, "ClearBuffer", arg_x(c, 1), arg_x(c, 2), arg_x(c, 3));
     *REC(cmd_of(c), OP_CLEAR_BUF, p_clear_buf) = (p_clear_buf){arg_x(c, 1), arg_x(c, 2), (uint32_t)arg_x(c, 3), 0};
 }
 // void nvnCommandBufferReportValue(NVNcommandBuffer *cmd, uint32_t value, NVNbufferAddress addr): the value lands when
@@ -927,6 +1010,7 @@ NVN_API(nvnCommandBufferClearBuffer) {
 // the same counter (main+0x7b9274 modes 1-3) and works in CPU-invisible pools; the CPU sees it after the fence, as a
 // counter report.
 NVN_API(nvnCommandBufferReportValue) {
+    gpu_watch(c, "ReportValue", arg_x(c, 2), 4, arg_x(c, 1));
     *REC(cmd_of(c), OP_CLEAR_BUF, p_clear_buf) = (p_clear_buf){arg_x(c, 2), 4, (uint32_t)arg_x(c, 1), 0};
 }
 // Colour reduction is a Maxwell bandwidth hint for blending into compressed targets: no effect on the result.
@@ -953,6 +1037,10 @@ NVN_API(nvnCommandBufferCopyBufferToTexture) {
 NVN_API(nvnCommandBufferCopyTextureToBuffer) {
     p_copy_b2t *o = REC(cmd_of(c), OP_COPY_T2B, p_copy_b2t);
     o->src = arg_x(c, 4);
+    {
+        const NVNcopyRegion *rg = arg_p(c, 3);   // an upper bound: 16 bytes a texel
+        gpu_watch(c, "CopyTextureToBuffer", o->src, 16ull * (uint64_t)rg->width * (uint64_t)rg->height * (uint64_t)rg->depth, 0);
+    }
     o->tex = tex_pin(arg_p(c, 1));
     copy_view(&o->view, &o->has_view, arg_p(c, 2));
     o->r = *(const NVNcopyRegion *)arg_p(c, 3);
@@ -1114,7 +1202,7 @@ const char *nvn_op_name(uint32_t op) {
         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC",
+        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC", "DRAW_MESH",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

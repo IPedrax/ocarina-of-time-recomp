@@ -51,6 +51,11 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 XLATE = ROOT / 'build' / 'xlate' / 'oot_xlate.exe'
@@ -287,7 +292,7 @@ def build_lowerer(out):
     h = hashlib.sha256(b''.join(p.read_bytes() for p in LOWER_SOURCES)).hexdigest()
     if exe.is_file() and stamp.is_file() and stamp.read_text() == h:
         return exe
-    cc = [r'C:\msys64\ucrt64\bin\clang.exe'] if os.name == 'nt' else ['cc']
+    cc = [str(MSYS2_ROOT / 'ucrt64' / 'bin' / 'clang.exe')] if os.name == 'nt' else ['cc']
     cmd = cc + ['-std=c11', '-O2', '-Wall', '-Wextra', '-I', str(ROOT / 'runtime'), '-o', str(exe)] + [str(p) for p in LOWER_SOURCES]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
@@ -302,9 +307,11 @@ def lower(programs, out):
     exe = build_lowerer(out)
     low = out / 'lowered'
     low.mkdir(exist_ok=True)
-    request = ''.join(f'{key} {p["stage"]} {out / "ctl" / (key + ".ctl")} {out / "code" / (key + ".code")} '
-                      f'{low / (key + ".code")} {low / (key + ".c1")}\n' for key, p in sorted(programs.items()))
-    r = subprocess.run([str(exe), '--batch'], input=request, capture_output=True, text=True)
+    # Paths relative to out, where the helper runs: the request is split at spaces, and the repository's path may
+    # hold one.
+    request = ''.join(f'{key} {p["stage"]} ctl/{key}.ctl code/{key}.code lowered/{key}.code lowered/{key}.c1\n'
+                      for key, p in sorted(programs.items()))
+    r = subprocess.run([str(exe), '--batch'], input=request, capture_output=True, text=True, cwd=out)
     ok, failures = 0, {}
     for line in r.stdout.splitlines():
         parts = line.split(' ', 3)

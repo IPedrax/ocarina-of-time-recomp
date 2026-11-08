@@ -47,14 +47,26 @@ plays on screen, upscaled to 2560x1440 by the game's neural network through the 
 (HMMA, LDSM, MOVM); HMMA runs on the host's tensor cores (VK_KHR_cooperative_matrix, translator patch 0016) and
 the title plays at 60 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
 (`gfx_shader.c`): bump the latter after a lowering change. The first run after a translator or lowering change spends
-a minute building the kernels' pipelines (the driver's disk cache keeps them); about one run in two dies right after
-the first frame (an SDK abort in MultiWait, see the docs). The level's materials sample a placeholder until pool-indexed (bindless) textures are
-bound: `docs/bindless.md` is the hand-off for that work.
+a minute building the kernels' pipelines (the driver's disk cache keeps them). The start-up crash that killed
+about one run in two right after the first frame is fixed (`docs/phase3.md`, "the start-up crash"). Pool-indexed
+(bindless) textures are bound through a persistent pool set with GPU sampling
+feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon). Mesh and task shaders: `docs/mesh.md` and
+`docs/mesh-tracker.md`; pointers that shaders load from memory: `docs/pointers.md`. Since #12 (2026-11-08) the level
+draws its geometry at about 59 fps, with large white areas and stretched triangles, and two kernels skipped by default
+(`SKIP_CS_DEFAULT`): `docs/level.md` is the hand-off for that (measurements, what Fritchii and Hookshot do, the plan).
+#13 (occlusion reports kept per address) made objects stop vanishing. Most of the white is missing geometry with the
+sky showing through; the culling chain's indirect records are written by the game's CPU code (`main+0x566fd0` via
+`main+0x2bfd340`) from what it reads back out of pass 0's output (`0x29bb9c000`, via `main+0x2bfd750`), and it
+reads 0 (`docs/level.md`). The game embeds Lua, whose errors longjmp: `runtime/sjlj.c` with recomp/gen.py's
+`RT_SETJMP` at every call to a setjmp PLT stub (since d105aa9; before it the game died at `main+0x1661690`).
+Long runs need memory headroom: the game commits about 21 GB on the level.
+`python3.14 tools/shader_census.py --version v131072 --lower` lowers the whole corpus (14,363 programs) and lists
+the refusals in `build/v131072/shaders/lowered.txt`.
 
 ## Running and checking
 
 - Run the game with `python3 tools/run.py` (`--seconds`, `--shot`, `--press-a`, `--env OOT_X=V`, `--fresh-cache`,
-  `--dump`, `--expect REGEX`), never by hand: it names every `OOT_*` variable in WSLENV, retries the start-up crash,
+  `--dump`, `--expect REGEX`), never by hand: it names every `OOT_*` variable in WSLENV, retries a crash in the first 25 s,
   numbers the log (`build/logs/run-<n>.log`), kills `oot.exe` and `oot_xlate.exe` afterwards and refuses to overlap
   runs. `--expect` checks the log for a line proving a diagnostic switch applied.
 - After a change to the lowering, the translator or anything a shader computes, follow the project skill

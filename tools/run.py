@@ -10,8 +10,8 @@ What it takes care of, each a mistake made by hand at least once:
     Windows program and silently ignores the rest.
   - oot.exe and oot_xlate.exe are killed after every run (the exit path can hang), and a run refuses to start while
     one is alive (two runs share the shader cache and the window; --kill-existing kills it first).
-  - The start-up crash (an SDK abort in MultiWait, about one run in two, docs/phase3.md) is retried: a run that exits
-    non-zero within its first 25 s is run again, up to --retry times. A later crash is reported, not retried.
+  - A run that exits non-zero within its first 25 s is run again, up to --retry times (once for the start-up crash,
+    fixed since: docs/phase3.md); --retry 0 shows every crash. A later crash is reported, not retried.
   - The window keeps focus as far as the game knows (OOT_ASSUME_FOCUS=1): out of focus the game pauses itself, as on
     the console under the HOME menu. --no-focus-pin to test that.
   - --press-a presses A at frame 600, which brings up the title menu over the cinematic. --record FILE writes what
@@ -50,7 +50,9 @@ def running() -> list[str]:
     if not WIN:
         return [p for p in PROCS if subprocess.run(["pgrep", "-x", p], capture_output=True).returncode == 0]
     out = subprocess.run(["tasklist.exe"], capture_output=True, text=True).stdout.lower()
-    return [p for p in PROCS if p in out]
+    # Whole image names: a substring test takes WhatsApp.Root.exe for oot.exe.
+    names = {line.split()[0] for line in out.splitlines() if line.strip()}
+    return [p for p in PROCS if p.lower() in names]
 
 
 def kill_all() -> None:

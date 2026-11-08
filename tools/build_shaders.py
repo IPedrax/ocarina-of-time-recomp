@@ -17,11 +17,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import os
 from pathlib import Path
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parent.parent
+BIN = (MSYS2_ROOT / r'ucrt64\bin')
 if sys.platform == 'win32':
-    GLSLC, SPIRV_VAL = Path(r'C:\msys64\ucrt64\bin\glslc.exe'), Path(r'C:\msys64\ucrt64\bin\spirv-val.exe')
+    GLSLC, SPIRV_VAL = BIN / 'glslc.exe', BIN / 'spirv-val.exe'
 else:   # Linux: the tools from PATH (Fedora: glslc from shaderc, spirv-val from spirv-tools)
     GLSLC = Path(shutil.which('glslc') or 'glslc')
     SPIRV_VAL = Path(shutil.which('spirv-val') or 'spirv-val')
