@@ -1,0 +1,63 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
+@@ -84,6 +84,40 @@
+             }
+         }
+ 
++        // The mesh stage buffer starts zeroed, as on the hardware: the epilogue copies every vertex slot and the index
++        // bytes below the primitive count, and bytes no ISBEWR wrote were whatever shared memory held (long thin
++        // triangles across the level). Run at the start of the program: each of the 32 threads clears every 32nd word
++        // (the last group clamped to the final word, which only writes it twice), then a barrier so no thread's clear
++        // lands after another thread's ISBEWR.
++        public static void MeshPrologue(EmitterContext context)
++        {
++            ShaderDefinitions d = context.TranslatorContext.Definitions;
++
++            if (d.MeshStage != 2)
++            {
++                return;
++            }
++
++            int id = context.ResourceManager.SharedMemoryId;
++            int first = d.MeshBufferBase >> 2;
++            int count = ((d.MeshBufferBase + MeshAttrBytes(d) + 4 + 3 * d.MeshMaxPrimitives + 3) >> 2) - first;
++            Operand tid = context.Load(StorageKind.Input, IoVariable.ThreadId, null, Const(0));
++
++            for (int j = 0; j * 32 < count; j++)
++            {
++                Operand w = context.IAdd(tid, Const(32 * j));
++
++                if ((j + 1) * 32 > count)
++                {
++                    w = context.IMinimumU32(w, Const(count - 1));
++                }
++
++                context.Store(StorageKind.SharedMemory, id, context.IAdd(w, Const(first)), Const(0));
++            }
++
++            context.Barrier();
++        }
++
+         public static void MeshEpilogue(EmitterContext context)
+         {
+             ShaderDefinitions d = context.TranslatorContext.Definitions;
+--- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
+@@ -1,4 +1,5 @@
+ using Ryujinx.Graphics.Shader.Decoders;
++using Ryujinx.Graphics.Shader.Instructions;
+ using Ryujinx.Graphics.Shader.IntermediateRepresentation;
+ using System;
+ using System.Linq;
+@@ -183,6 +184,11 @@
+                     initializationOperations = context.OperationsCount;
+                 }
+ 
++                if (index == 0 && translatorContext.Definitions.MeshStage == 2)
++                {
++                    InstEmit.MeshPrologue(context);
++                }
++
+                 DecodedFunction function = program.GetFunctionById(index);
+ 
+                 foreach (Block block in function.Blocks)
