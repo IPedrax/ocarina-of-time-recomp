@@ -3038,10 +3038,43 @@ out:
     return pipe;
 }
 
+// Mesh pipelines are built off the replay thread when pipelines build asynchronously (vk_pipeline_async_on): a
+// monolithic task + mesh + fragment pipeline takes the driver seconds, and built inline under P.lock it held the level's
+// first frames for up to 36 s (2026-11-08, worst frame "pipeline build 36458 ms") and every other pipeline lookup with
+// it. Until its job has added the pipeline, a lookup of the key returns VK_NULL_HANDLE and the draw is skipped, as
+// draws whose pipeline builds are (vk_exec_draw.c OOT_PIPE_SKIP). OOT_PIPE_SYNC (run.py --shot) builds them inline.
+typedef struct { uint32_t tag; const GfxShader *ts, *ms; GKey k; } MeshKey;
+typedef struct MeshJob {
+    struct MeshJob *next;
+    uint64_t h;
+    MeshKey key;
+    VkPipeState s;
+    const GfxShader *sh[3];
+    uint32_t off[3];
+    Layout *l;
+    Bindings B;
+} MeshJob;
+static MeshJob *mesh_jobs;   // being built; under P.lock
+
+static void CALLBACK mesh_build(PTP_CALLBACK_INSTANCE inst, void *arg) {
+    (void)inst;
+    MeshJob *j = arg;
+    VkPipeline pipe = mesh_create(&j->s, &j->key.k, j->sh, j->off, j->l);
+    AcquireSRWLockExclusive(&P.lock);
+    if (!pipe) P.stats.failures++, rt_log("vk_pipeline: mesh pipeline not built: pipeline creation failed");
+    pipe_add(&j->key, sizeof j->key, j->h, pipe, j->l, &j->B, VK_PIPELINE_BIND_POINT_GRAPHICS, 0);
+    for (MeshJob **q = &mesh_jobs; *q; q = &(*q)->next)
+        if (*q == j) { *q = j->next; break; }
+    ReleaseSRWLockExclusive(&P.lock);
+    if (pipe) rt_log("vk_pipeline: a mesh pipeline built in the background (%s mesh + fragment, %u bindings)",
+                     j->sh[0] ? "task +" : "", j->B.n);
+    free(j);
+}
+
 VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const GfxShader *ms, const VkPipeInfo **info) {
     if (info) *info = NULL;
     if (!ms || !vk_ctx()->has_mesh_shader || !ensure_init()) return VK_NULL_HANDLE;
-    struct { uint32_t tag; const GfxShader *ts, *ms; GKey k; } key;
+    MeshKey key;
     memset(&key, 0, sizeof key);
     VkPipeState t = *s;
     t.vs = NULL;
@@ -3054,6 +3087,13 @@ VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const Gfx
     uint64_t h = key_hash(&key, sizeof key);
     AcquireSRWLockExclusive(&P.lock);
     Pipe *p = pipe_find(&key, sizeof key, h);
+    MeshJob *pending = NULL;
+    if (!p)
+        for (pending = mesh_jobs; pending && (pending->h != h || memcmp(&pending->key, &key, sizeof key)); pending = pending->next) {}
+    if (pending) {
+        ReleaseSRWLockExclusive(&P.lock);
+        return VK_NULL_HANDLE;   // its job is building it: this draw is skipped
+    }
     if (p) {
         P.stats.hits++;
     } else {
@@ -3069,6 +3109,19 @@ VkPipeline vk_pipeline_mesh(const VkPipeState *s, const GfxShader *ts, const Gfx
         }
         Layout *l = why ? NULL : layout_get(&B);
         if (!why && !l) why = "descriptor layout creation failed";
+        if (!why && A.on) {
+            MeshJob *j = calloc(1, sizeof *j);
+            if (j) {
+                j->h = h, j->key = key, j->s = *s, j->l = l, j->B = B;
+                memcpy(j->sh, sh, sizeof sh), memcpy(j->off, off, sizeof off);
+                j->next = mesh_jobs, mesh_jobs = j;
+                if (TrySubmitThreadpoolCallback(mesh_build, j, NULL)) {
+                    ReleaseSRWLockExclusive(&P.lock);
+                    return VK_NULL_HANDLE;
+                }
+                mesh_jobs = j->next, free(j);   // no thread pool: built inline below
+            }
+        }
         VkPipeline pipe = why ? VK_NULL_HANDLE : mesh_create(s, &key.k, sh, off, l);
         if (!why && !pipe) why = "pipeline creation failed";
         if (why) {

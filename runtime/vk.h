@@ -221,6 +221,9 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when al
 // The pointer table (vk_memory.c, docs/pointers.md): the storage buffer shaders read to turn a GPU address into a
 // device address. 0 when it is off.
 int vk_mem_ptr_table(VkBuffer *buf, VkDeviceSize *size);
+// Its device address, which the support buffer hands to shaders at byte 1408 (vk_exec_draw.c support_fill), so a
+// shader can read the table through a pointer without a storage binding; 0 when it is off.
+uint64_t vk_mem_guest_pages(void);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);

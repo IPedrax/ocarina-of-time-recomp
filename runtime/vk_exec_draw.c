@@ -36,7 +36,7 @@
 #define MAX_DESC 2048   // a light-list texture array alone is 1024 (tools/xlate/Program.cs)
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 65536u
-#define SUPPORT_BYTES 1408u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
+#define SUPPORT_BYTES 1424u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_CS 5
@@ -488,6 +488,52 @@ static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
+// Bytes of a texel of an uncompressed colour format; 0 for the others (compressed, depth, packed YUV, unknown).
+static uint32_t texel_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_R5G5B5A1_UNORM_PACK16: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        return 2;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32_SFLOAT:
+        return 4;
+    case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+        return 8;
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+    default: return 0;
+    }
+}
+
+// The format of a view that reinterprets the texture's bits in another format of the same texel size (NVN's
+// nvnTextureViewSetFormat), or 0 to keep the texture's. OoT's end-of-frame kernel 3ce2b98c packs R11G11B10F texels
+// itself and stores them through an R32UI view of the R11G11B10F target: with the texture's format the shader's
+// integer image met a float view, the stores were lost and the scene's unmapped HDR went to the screen, white
+// (2026-11-07, frame dump pass 163). The images are MUTABLE_FORMAT (vk_texture.c). OOT_VIEW_FORMAT=0: off.
+static VkFormat reinterpret_format(const VkTexImage *img, const view_t *v, int hv, int storage) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("OOT_VIEW_FORMAT"); off = e && !strcmp(e, "0"); }
+    if (off || !hv || !v->set_format || img->block_views || img->storage_format || img->alpha_one || img->chan[0] ||
+        img->aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+        return 0;
+    TexVkFormat b;
+    if (!tex_vk_format(v->format, &b) || b.vk != b.ideal || b.depth || b.stencil || b.vk == img->format) return 0;
+    uint32_t n = texel_bytes(img->format);
+    if (!n || texel_bytes(b.vk) != n) return 0;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, b.vk, &fp);
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!(fp.optimalTilingFeatures & need)) return 0;
+    return b.vk;
+}
+
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
@@ -543,6 +589,14 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     VkFormat vf = storage && img->storage_format ? img->storage_format : img->format;   // sRGB stored through UNORM
+    VkFormat rf = reinterpret_format(img, v, hv, storage);
+    if (rf) {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 8)
+            rt_log("vk_exec: %s view of image %#llx (%ux%u vk format %d) in its view format %d", storage ? "storage" : "sampled",
+                   (unsigned long long)img->addr, img->width, img->height, (int)img->format, (int)rf);
+        vf = rf;
+    }
     ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -553,7 +607,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                       .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views || img->storage_format) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
+    if (img->block_views || img->storage_format || rf) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
                                                                      // (vk_texture.c); an sRGB image's STORAGE usage is its UNORM view's
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -1138,6 +1192,8 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     return a;
 }
 
+static uint32_t ptr_slots[NVN_STAGES];   // per NVN stage: storage slots ptr_targets_add filled for the dispatch or draw being recorded
+
 // OOT_CS_READBACK=<frame> (diagnostic, docs/mesh-tracker.md): from that frame on (512 copies) every dispatch copies the first 64 bytes of
 // each storage buffer it writes, right after it, into a host buffer; they are logged when the submission completed,
 // with the kernel's code hash, its group counts and the buffer's guest address. Reading them in order shows which
@@ -1216,6 +1272,10 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
     VkDescriptorBufferInfo bi;
     int ubo, slot = ssbo_slot(r, st, &ubo);
+    // A pointer target is bound for reading: the storage-table fallback (translator patch 0022) marks every slot of a
+    // kernel written as soon as one store goes through it, and a write-back of each target per dispatch cost the
+    // level's frames most of a second of replay (2026-11-07).
+    if (st >= 0 && st < NVN_STAGES && !ubo && slot >= 0 && slot < 16 && (ptr_slots[st] >> slot & 1)) written = 0;
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
@@ -1871,7 +1931,14 @@ static void pool_sync(VkExec *ex, PoolSet *p, uint32_t mask) {
     }
     uint32_t imgs = p->filled & ~(1u << GFX_POOL_SAMPLER);
     int first_new = p->nwanted;
-    if (read_fb) {   // ids the GPU sampled, as of the last completed copy, join the wanted list
+    static int resolve = -1;   // OOT_POOL_RESOLVE=0 (diagnostic): no id is ever resolved, every pool element keeps
+                               // the stand-in of its view type (what pool samples read before d84bf5d)
+    if (resolve < 0) {
+        const char *e = cfg_get("OOT_POOL_RESOLVE");
+        resolve = !(e && *e == '0');
+        if (!resolve) rt_log("vk_exec: OOT_POOL_RESOLVE=0: pool-indexed textures keep their stand-ins");
+    }
+    if (read_fb && resolve) {   // ids the GPU sampled, as of the last completed copy, join the wanted list
         p->fb_read_ms = t0;
         PST.fb_reads++;
         vmaInvalidateAllocation(vk_ctx()->vma, p->rb_alloc, 0, VK_WHOLE_SIZE);
@@ -2024,6 +2091,8 @@ static void support_fill(uint8_t *b, float w, float h, float point_size) {
     memcpy(b + 160, size, 16);
     const float one = 1.0f;
     memcpy(b + 1392, &point_size, 4);   // point_size (translator patch 0008): vertex shaders that write none output it
+    uint64_t gp = vk_mem_guest_pages();
+    memcpy(b + 1408, &gp, 8);           // the pointer table's device address (vk_memory.c, docs/pointers.md)
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
 }
 
@@ -3042,9 +3111,19 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
 // OOT_SKIP_CS=all|<hex>[,<hex>...]|!<hex>[,...] (diagnostic): compute dispatches of every shader, of those whose input
 // id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU timeout (2026-11-06: the
 // Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
+// Without OOT_SKIP_CS, SKIP_CS_DEFAULT: kernels that translate but are known to write wrong values, left out until
+// they are fixed, as they were while they did not translate (OOT_SKIP_CS=none runs them):
+// - ace1cec0 (the level's background, 64x64 groups): black and white blocks over the whole picture (2026-11-08, with
+//   main's uniform-buffer table; before it, a device loss);
+// - 3f15911a (an indirect dispatch between the end-of-frame histogram 745220f3 and 3ce2b98c, bit masks written with
+//   SURED.OR): blown-out white patches that flicker with the camera's distance, from the merge that made its LEA
+//   with a negated addend lower (2026-11-08: build/logs/dump-197 is clean up to the fog composite, pass 0128; skipped,
+//   the picture is too, build/logs/skip-3f15.png).
+#define SKIP_CS_DEFAULT "ace1cec0,3f15911a"
 static int skip_cs(const GfxShader *cs) {
     const char *e = getenv("OOT_SKIP_CS");
-    if (!e || !*e) return 0;
+    if (!e) e = SKIP_CS_DEFAULT;
+    if (!*e || !strcmp(e, "none")) return 0;
     char hex[17];
     const uint8_t *id = gfx_shader_input_id(cs);
     for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
@@ -3065,6 +3144,72 @@ static int skip_cs(const GfxShader *cs) {
     return skip;
 }
 
+// Pointers in storage buffers (translator patch 0022): a kernel may load a 64-bit address from a bound buffer and read
+// through it (the level's fog kernel 1a62084a takes its light data from the pointer at +0x20 of its 64-byte storage
+// slot 2). The translator cannot trace such an address and looks it up at run time among the entries of the storage
+// table (c0 + 0x310), where the game binds only its own slots; the buffer the pointer leads to is not among them, and
+// the read gave 0. So before a dispatch, every 8-byte word of the small bound storage buffers (up to PTR_SCAN bytes,
+// as the CPU wrote them) that is an address of backed GPU memory outside the bound ones takes a free storage slot for
+// that dispatch, sized to what its span holds (up to PTR_SPAN); the game's bindings come back after it.
+enum { PTR_SCAN = 1024, PTR_SPAN = 64 << 20 };
+// The buffer's bytes are readable in place when an imported pool backs them (guest memory the CPU wrote); device
+// pools are not. Not VirtualQuery: on the level's large committed regions it walked page tables for milliseconds per
+// call, 16 calls per dispatch, most of a second per frame (2026-11-07, OOT_PROFILE_RENDER).
+static int ptr_readable(uint64_t a, uint64_t n) {
+    VkMemSpan sp;
+    return a && vk_mem_resolve(a, n, &sp) && sp.pool;
+}
+// st: NVN_STAGE_CS for a dispatch, NVN_STAGE_VS or NVN_STAGE_FS for a draw (the stages whose storage table the
+// translator's fallback searches: c0 0x310, 0x110, 0x510).
+static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
+    p_bind_buf *sb = ex->ssbo[st];
+    memcpy(saved, sb, 16 * sizeof *sb);
+    int added = 0;
+    ptr_slots[st] = 0;
+    static int off = -1, off_gfx;   // OOT_PTR_BIND=0 (diagnostic): no pointer targets bound; OOT_PTR_BIND_GFX=0: none for draws
+    static uint64_t span_max;   // OOT_PTR_SPAN=<bytes> (diagnostic): the most a target binds
+    if (off < 0) {
+        const char *e = getenv("OOT_PTR_BIND");
+        off = e && !strcmp(e, "0");
+        e = getenv("OOT_PTR_BIND_GFX");
+        off_gfx = e && !strcmp(e, "0");
+        e = getenv("OOT_PTR_SPAN");
+        span_max = e && *e ? strtoull(e, NULL, 0) : PTR_SPAN;
+        if (e && *e) rt_log("vk_exec: OOT_PTR_SPAN: pointer targets bind at most %llu bytes", (unsigned long long)span_max);
+    }
+    if (off || (st != NVN_STAGE_CS && off_gfx)) return 0;
+    for (int k = 0; k < 16; k++) {
+        uint64_t base = saved[k].addr, size = saved[k].size;
+        if (!base || !size || size > PTR_SCAN || (base & 7) || !ptr_readable(base, size)) continue;
+        for (uint64_t o = 0; o + 8 <= size; o += 8) {
+            uint64_t v = *(const uint64_t *)(uintptr_t)(base + o);
+            if (v < 0x10000 || (v >> 40) || (v & 3)) continue;
+            int known = 0, free_slot = -1;
+            for (int j = 0; j < 16; j++) {
+                if (sb[j].size && v >= sb[j].addr && v < sb[j].addr + sb[j].size) known = 1;
+                if (!sb[j].size && free_slot < 0) free_slot = j;
+            }
+            VkMemSpan sp;
+            if (known || free_slot < 0 || !vk_mem_resolve(v, 16, &sp)) continue;
+            sb[free_slot] = (p_bind_buf){st, free_slot, v, sp.avail < span_max ? sp.avail : span_max};
+            ptr_slots[st] |= 1u << free_slot;
+            added++;
+            static uint32_t seen[64];   // logged once per (stage, storage slot, offset) the pointer was found at
+            static int nseen;
+            uint32_t where = (uint32_t)st << 24 | (uint32_t)k << 16 | (uint32_t)o;
+            int fresh = nseen < 64;
+            for (int i = 0; i < nseen && fresh; i++) fresh = seen[i] != where;
+            if (fresh) seen[nseen++] = where;
+            if (fresh)
+                rt_log("vk_exec: pointer %#llx at %#llx+%#llx of %s storage slot %d bound to free slot %d (%llu bytes)",
+                       (unsigned long long)v, (unsigned long long)base, (unsigned long long)o,
+                       st == NVN_STAGE_CS ? "compute" : st == NVN_STAGE_VS ? "vertex" : "fragment", k, free_slot,
+                       (unsigned long long)sb[free_slot].size);
+        }
+    }
+    return added;
+}
+
 static void op_dispatch_steps(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -3080,7 +3225,19 @@ static void op_dispatch_steps(VkExec *ex, const p_dispatch *d) {
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
-    if (!cs) {
+    if (!cs) {   // which kernels a frame loses, once per program: the size and the game's call site tell them apart
+        static SRWLOCK lock = SRWLOCK_INIT;
+        static uint64_t seen[128];
+        static int nseen;
+        int fresh = 1;
+        AcquireSRWLockExclusive(&lock);
+        for (int i = 0; i < nseen && fresh; i++) fresh = seen[i] != ex->prog->serial;
+        if (fresh && nseen < 128) seen[nseen++] = ex->prog->serial;
+        else fresh = 0;
+        ReleaseSRWLockExclusive(&lock);
+        if (fresh)
+            rt_log("vk: dispatch %dx%dx%d of program %llu from %#llx skipped: its shader did not translate", d->x, d->y,
+                   d->z, (unsigned long long)ex->prog->serial, (unsigned long long)d->caller);
         const uint8_t *ctl, *code;
         uint32_t len;
         if (vk_dump_armed && ex->prog && vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) {
@@ -3117,6 +3274,37 @@ static void op_dispatch_steps(VkExec *ex, const p_dispatch *d) {
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     op_dispatch_steps(ex, d);
     vk_trace_stage(5);
+}
+
+static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d);
+// A dispatch with the pointer targets of its storage buffers bound for it (ptr_targets_add), then the game's bindings.
+static void op_dispatch_ptr(VkExec *ex, const void *payload, int indirect) {
+    p_bind_buf saved[16];
+    int added = ptr_targets_add(ex, NVN_STAGE_CS, saved);
+    if (indirect) op_dispatch_ind(ex, payload);
+    else op_dispatch(ex, payload);
+    ptr_slots[NVN_STAGE_CS] = 0;
+    if (added) memcpy(ex->ssbo[NVN_STAGE_CS], saved, sizeof saved);
+}
+
+// A draw with the pointer targets of its vertex and fragment storage buffers bound for it (Kokiri's lighting reads
+// light records through such pointers, as Hookshot's commit ffcdb71 found), then the game's bindings. Draws without a
+// pointer keep their bindings untouched, so their resource sets stay cached.
+static void op_draw_ptr(VkExec *ex, int op, const void *payload) {
+    static const int st[2] = {NVN_STAGE_VS, NVN_STAGE_FS};
+    p_bind_buf saved[2][16];
+    int added[2];
+    for (int i = 0; i < 2; i++) added[i] = ptr_targets_add(ex, st[i], saved[i]);
+    switch (op) {
+    case OP_DRAW: op_draw(ex, payload); break;
+    case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
+    case OP_DRAW_IND: op_draw_ind(ex, payload); break;
+    default: op_draw_idx_ind(ex, payload); break;
+    }
+    for (int i = 0; i < 2; i++) {
+        ptr_slots[st[i]] = 0;
+        if (added[i]) memcpy(ex->ssbo[st[i]], saved[i], sizeof saved[i]);
+    }
 }
 
 // OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible
@@ -3170,7 +3358,7 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
 // Mesh tasks (docs/mesh.md, docs/mesh-tracker.md D3): the bound program's task (optional), mesh and fragment shaders
-// as one mesh pipeline (vk_pipeline_mesh, built on this thread, shaders awaited), then the draw path's pass, state and
+// as one mesh pipeline (vk_pipeline_mesh, built in the background, shaders awaited), then the draw path's pass, state and
 // resources, and vkCmdDrawMeshTasks(Indirect)EXT through the recorder. The indirect record is taken as Vulkan's
 // {x, y, z} group counts at its address (its 16-byte stride is the game's; a frame dump note shows its words as the
 // CPU sees them). Counted, logged at powers of two from 256; OOT_MESH=0 skips them all (diagnostic).
@@ -3232,7 +3420,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     s.xfb = 0;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_mesh(&s, ts, ms, &info);
-    if (!p || !info) return warn_once(W_PIPELINE, "a mesh pipeline could not be created: mesh draws with it are skipped");
+    if (!p || !info) return;   // building in the background (vk_pipeline_mesh), or failed (logged there)
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         vk_pipeline_set_dynamic(ex->cb, &s);
@@ -3508,12 +3696,9 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     }
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
-    case OP_DRAW: op_draw(ex, payload); break;
-    case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
-    case OP_DISPATCH: op_dispatch(ex, payload); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
-    case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
-    case OP_DRAW_IND: op_draw_ind(ex, payload); break;
-    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); ex->push_cc_len = 0; break;
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_IND: op_draw_ptr(ex, op, payload); break;
+    case OP_DISPATCH: op_dispatch_ptr(ex, payload, 0); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
+    case OP_DISPATCH_IND: op_dispatch_ptr(ex, payload, 1); ex->push_cc_len = 0; break;
     case OP_DRAW_MESH: op_draw_mesh(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }

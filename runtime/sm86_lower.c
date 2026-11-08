@@ -63,6 +63,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 // ---- the lowering context
 
 #define NSCRATCH 12
+#define PROBE_REG 254                                 // OOT_PROBE's capture register (sm86_probe_match)
 #define RZ 255u
 #define PT 7u
 #define NOREG 0xffffffffu
@@ -81,6 +82,7 @@ typedef struct {
     struct { uint32_t out, target; } *imm_reloc;
     uint32_t max_gpr;                              // highest general register the program touches
     uint32_t ur_next, scratch_base;                // the pool above max_gpr: uniform registers from ur_next up
+    int probe, nprobe; uint32_t probe_index[3], probe_reg[3];   // OOT_PROBE (sm86_probe_match): the instruction and register captured
                                                    // to scratch_base, scratch registers from there (allocated
                                                    // on first use, ascending so pairs and runs stay adjacent)
     int nscratch;
@@ -170,6 +172,17 @@ static uint32_t S(L *l, int k) {
         return fail(l, "no general register free for scratch"), RZ;
     if (l->nscratch <= k) l->nscratch = k + 1;
     return l->scratch_base + (uint32_t)k;
+}
+
+// n consecutive scratch registers from index first on whose first register is a multiple of n (Maxwell's 64- and
+// 128-bit operands); RZ, with the lowering failed, when the scratch range has none.
+static uint32_t S_aligned(L *l, int first, uint32_t n) {
+    for (int k = first; k + (int)n <= NSCRATCH; k++)
+        if ((l->scratch_base + (uint32_t)k) % n == 0) {
+            uint32_t r = S(l, k + (int)n - 1);   // claims the run (fails if it is past the free range)
+            return r == RZ ? RZ : r - (n - 1);
+        }
+    return fail(l, "no aligned scratch run"), RZ;
 }
 
 typedef struct Src Src;
@@ -1024,7 +1037,11 @@ static void lower_isetp(L *l, const Insn *x) {
     emit(l, w);
 }
 
-// SEL (0x007) and FSEL (0x008): a when the predicate at 87-89 (90) holds, else b.
+// SEL (0x007) and FSEL (0x008): a when the predicate at 87-89 (90) holds, else b. Both become Maxwell SEL, which moves
+// bits: its immediate is the integer I20 form whatever the source, so an FSEL constant takes the integer rule (1.0 does
+// not fit and goes through a scratch register). With the float rule, FSEL's 1.0 became SEL's integer 0x3f800, a
+// denormal read as 0: the fog kernel's trilinear light weights (FSEL 1e-5 : 1.0) all came out 0 and the RCP of their
+// sum gave its NaN (2026-11-07, OOT_PROBE on 1a62084a).
 static void lower_sel(L *l, const Insn *x, int floating) {
     uint32_t rd = bits(x, 16, 8);
     Src a = src0(x, floating), b = srcn(l, x, 1, floating);
@@ -1032,7 +1049,7 @@ static void lower_sel(L *l, const Insn *x, int floating) {
     int is32;
     uint64_t w;
     if (b.neg || b.abs_) w = 0x5ca0000000000000ull | ((uint64_t)to_reg(l, b, 1, 0, 0) << 20);
-    else w = b_slot(l, b, 0x5ca0000000000000ull, 0x4ca0000000000000ull, 0x38a0000000000000ull, 0, floating, 1, &is32);
+    else w = b_slot(l, b, 0x5ca0000000000000ull, 0x4ca0000000000000ull, 0x38a0000000000000ull, 0, 0, 1, &is32);
     w |= l->pred | rd | ((uint64_t)ra << 8) | ((uint64_t)bits(x, 87, 3) << 39) | ((uint64_t)bits(x, 90, 1) << 42);
     emit(l, w);
 }
@@ -1625,6 +1642,11 @@ static void lower_sust(L *l, const Insn *x) {
     h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
     if (!cbuf_ok(&h)) return (void)fail(l, "SUST handle");
     uint32_t hr = to_reg(l, h, 4, 0, 0);
+    if (l->probe) {   // OOT_PROBE: the capture in every channel written
+        uint32_t n = (uint32_t)__builtin_popcount(mask);
+        for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), PROBE_REG - i % (uint32_t)l->nprobe);
+        data = S(l, 0);
+    }
     emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
                 ((uint64_t)hr << 39));
 }
@@ -2088,7 +2110,11 @@ static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
     // Negated operands (a: bit 73, b: bit 62; the upscaler's 0a9afab0 takes max(-x, -y), 2026-11-06) become a
     // subtraction from zero into scratch first, swizzle applied, so the sequence below sees plain pairs. Absolute
     // values (72, 63) are not lowered.
-    if (op != 0x240 || is_min < 0 || bits(x, 63, 1) || bits(x, 72, 1) || bits(x, 76, 11)) return (void)fail(l, "HMNMX2 mode");
+    if (op != 0x240 || is_min < 0 || bits(x, 63, 1) || bits(x, 72, 1) || bits(x, 76, 11)) {
+        char why[96];   // the words, so a new form can be read off the log without the program at hand
+        snprintf(why, sizeof why, "HMNMX2 mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
+    }
     if (bits(x, 73, 1)) emit(l, l->pred | HADD2_SUB_R(S(l, 3), RZ, 0, a, a_swz)), a = S(l, 3), a_swz = 0;
     if (bits(x, 62, 1)) emit(l, l->pred | HADD2_SUB_R(S(l, 4), RZ, 0, b, b_swz)), b = S(l, 4), b_swz = 0;
     uint32_t m = S(l, 1), d = S(l, 2);
@@ -2673,7 +2699,9 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 77, 4) || bits(x, 81, 3) != 7 ||
         (lod != 1 && !level) || bits(x, 59, 1) || mask == 0 || (bindless && (bits(x, 46, 13) || !bits(x, 91, 1))) ||
         (!bindless && bank >= 18))
-        return (void)fail(l, "TLD mode");
+        { char why[96];   // the words, so a new form can be read off the log
+          snprintf(why, sizeof why, "TLD mode %08x %08x %08x %08x", x->w[0], x->w[1], x->w[2], x->w[3]);
+          return (void)fail(l, why); }
     uint32_t coords[3], n = 0, lev = RZ;
     if (array || volume) coords[n++] = ra, coords[n++] = ra + 1, coords[n++] = rb;
     else if (dim == 1) coords[n++] = ra, coords[n++] = rb;
@@ -3027,7 +3055,9 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x3c4: return lower_redux(l, x);
     default:
         if (base_op >= 0x080 && base_op < 0x100) return lower_uniform_alu(l, x, op);
-        return (void)fail(l, "opcode");
+        char why[80];   // the opcode and words, so the log says which instruction is missing
+        snprintf(why, sizeof why, "opcode %#x: %08x %08x %08x %08x", op, x->w[0], x->w[1], x->w[2], x->w[3]);
+        return (void)fail(l, why);
     }
 }
 
@@ -3037,6 +3067,46 @@ void sm86_lower_free(Sm86Lowered *out) {
     free(out->code), free(out->c1);
     out->code = NULL, out->c1 = NULL;
 }
+
+// ---- OOT_PROBE=<code hash>:<offset>:<register> (diagnostic): a value of one program seen from outside
+// The program whose FNV-1a 64 of its SM86 code (the length the translation is given, as OOT_TENSOR_ONLY and
+// tools/kernel.py print it) starts with <code hash> is lowered with a capture: R254 is zeroed at the start, takes
+// <register> (decimal) right after the SM86 instruction at byte <offset> (hex, the code block's, header included: what
+// tools/sm86_dis.py prints), and every SUST of the program stores R254 in each channel it writes instead of its data.
+// The frame dump's statistics of the images the program writes (images.txt: min, max, NaN count) then describe that
+// register at that point, e.g. whether a value is already NaN there: bisect the instructions to the first that makes
+// one. gfx_shader.c gives the probed program a cache key of its own (its input id stays, so OOT_DUMP=cs: finds it).
+static struct { int parsed, on, as_int, n; char hash[17]; uint32_t offset[3], reg[3]; } probe_spec;
+static void probe_parse(void) {
+    if (probe_spec.parsed) return;
+    probe_spec.parsed = 1;
+    const char *e = getenv("OOT_PROBE");
+    unsigned off, reg;
+    char h[17];
+    if (e && sscanf(e, "%16[0-9a-fA-F]:%x:%u", h, &off, &reg) == 3 && reg < 255) {
+        snprintf(probe_spec.hash, sizeof probe_spec.hash, "%s", h);
+        probe_spec.offset[0] = off, probe_spec.reg[0] = reg, probe_spec.on = 1, probe_spec.n = 1;
+        // ,<offset>:<register> up to three captures in one run: the k-th goes to R(254 - k), and every SUST writes
+        // capture (channel % n) in each channel, so the dump's per-channel statistics answer three questions at once
+        for (const char *p = strchr(e, ','); p && probe_spec.n < 3; p = strchr(p + 1, ','))
+            if (sscanf(p + 1, "%x:%u", &off, &reg) == 2 && reg < 255)
+                probe_spec.offset[probe_spec.n] = off, probe_spec.reg[probe_spec.n] = reg, probe_spec.n++;
+        // <code hash>:<offset>:<register>:i captures the register as an unsigned integer converted to float, so the
+        // float statistics of the dump read integers (counts, indices, addresses' low words below 2^24 exactly)
+        const char *t = strrchr(e, ':');
+        probe_spec.as_int = t && t[1] == 'i';
+    }
+}
+int sm86_probe_match(const uint8_t *code, uint32_t len) {
+    probe_parse();
+    if (!probe_spec.on) return 0;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+    char hex[17];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    return !strncmp(hex, probe_spec.hash, strlen(probe_spec.hash));
+}
+const char *sm86_probe_spec(void) { return getenv("OOT_PROBE"); }
 
 int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out) {
     return sm86_lower_ex(code, code_size, control, control_size, out, sm86_lower_tensor_cores);
@@ -3072,11 +3142,29 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         l.liveness = compute_liveness(&l);
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
     }
+    if (sm86_probe_match(code, code_size)) {
+        if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG + 1 - (uint32_t)probe_spec.n)
+            fail(&l, "OOT_PROBE: no register free for the capture");
+        l.probe = 1, l.nprobe = probe_spec.n;
+        for (int k = 0; k < l.nprobe; k++) {
+            l.probe_index[k] = (probe_spec.offset[k] - header) / 16, l.probe_reg[k] = probe_spec.reg[k];
+            emit(&l, MOV32I | ((uint64_t)7 << 16) | (PROBE_REG - (uint32_t)k) | ((uint64_t)0xf << 12));   // = 0, unconditionally
+        }
+    }
     for (l.index = 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
         lower_one(&l, &l.in[l.index]);
+        for (int k = 0; l.probe && k < l.nprobe; k++) {
+            uint32_t cap = PROBE_REG - (uint32_t)k;
+            if (l.index != l.probe_index[k]) continue;
+            if (probe_spec.as_int)   // I2F.F32.U32, unconditionally
+                emit(&l, 0x5cb8000000000000ull | ((uint64_t)7 << 16) | cap | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) |
+                             ((uint64_t)l.probe_reg[k] << 20));
+            else   // the capture, unconditionally (a guarded write may not have happened)
+                emit(&l, MOV_R | ((uint64_t)7 << 16) | cap | QUAD | ((uint64_t)l.probe_reg[k] << 20));
+        }
         int pair;
         uint8_t kind, bank;
         uint32_t value;

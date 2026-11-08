@@ -146,6 +146,7 @@ static struct {
     uint64_t overflow, beyond;                 // pages refused: no block left / address past 39 bits
     VkBuffer buf;
     VmaAllocation alloc;
+    VkDeviceAddress addr;                      // buf's device address (the support buffer hands it to shaders)
     uint64_t check_frame;
 } PT = {.on = -1};
 static CRITICAL_SECTION pt_flush_lock;         // ptr_flush: one copy at a time, in the order of the changes
@@ -168,7 +169,8 @@ static int ptr_table_on(void) {
     PT.shadow = calloc(PT.n, 8);
     PT.dirty = calloc(PT.n / PT_CHUNK + 1, 1);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = PT.n * 8,
-                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (!PT.shadow || !PT.dirty || vmaCreateBuffer(c->vma, &bi, &ai, &PT.buf, &PT.alloc, NULL) != VK_SUCCESS) {
@@ -178,6 +180,10 @@ static int ptr_table_on(void) {
         return 0;
     }
     InitializeCriticalSection(&pt_flush_lock);
+    {
+        VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = PT.buf};
+        PT.addr = vkGetBufferDeviceAddress(c->device, &i);
+    }
     VkCommandBuffer cb = vk_upload_begin();   // all zero: every page unbacked until a pool fills it
     vkCmdFillBuffer(cb, PT.buf, 0, VK_WHOLE_SIZE, 0);
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -301,6 +307,8 @@ static void ptr_flush(void) {
     free(list), free(data);
     LeaveCriticalSection(&pt_flush_lock);
 }
+
+uint64_t vk_mem_guest_pages(void) { return PT.on == 1 ? PT.addr : 0; }
 
 int vk_mem_ptr_table(VkBuffer *buf, VkDeviceSize *size) {
     if (PT.on != 1) return 0;
@@ -2087,4 +2095,9 @@ void vk_mem_shutdown(void) {
     AcquireSRWLockExclusive(&gen_lock);
     for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL;
     ReleaseSRWLockExclusive(&gen_lock);
+    if (PT.on == 1) {   // the pointer table, before vmaDestroyAllocator (it asserts on allocations left)
+        vmaDestroyBuffer(c->vma, PT.buf, PT.alloc);
+        free(PT.shadow), free(PT.dirty);
+        PT.buf = VK_NULL_HANDLE, PT.alloc = NULL, PT.shadow = NULL, PT.dirty = NULL, PT.addr = 0, PT.on = 0;
+    }
 }

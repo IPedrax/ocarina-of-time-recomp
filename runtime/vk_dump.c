@@ -231,14 +231,14 @@ static void write_images(const Job *j) {
     uint8_t *out = malloc(n * 4);
     if (!px || !out) rt_fatal("vk_dump: out of memory for %s", j->name);
     float mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-    uint64_t nans = 0;
+    uint64_t nans = 0, cnan[4] = {0};
     for (uint32_t z = 0; z < j->d; z++)
         for (uint32_t y = 0; y < j->h; y++)
             for (uint32_t x = 0; x < j->w; x++) {
                 float *o = px + 4 * ((uint64_t)y * pw + (uint64_t)z * j->w + x);
                 decode(j->f, j->map + (((uint64_t)z * j->h + y) * j->w + x) * j->f->bytes, o);
                 for (int c = 0; c < 4; c++) {
-                    if (isnan(o[c])) { nans++, o[c] = 0; continue; }
+                    if (isnan(o[c])) { nans++, cnan[c]++, o[c] = 0; continue; }
                     if (o[c] < mn[c]) mn[c] = o[c];
                     if (o[c] > mx[c]) mx[c] = o[c];
                 }
@@ -278,9 +278,10 @@ static void write_images(const Job *j) {
     uint64_t all = distinct(j, 0, j->h), top = distinct(j, 0, j->h / 4 ? j->h / 4 : 1);
     AcquireSRWLockExclusive(&img_lock);
     if (images_f) {
-        fprintf(images_f, "%s %ux%ux%u min %g %g %g %g max %g %g %g %g distinct %llu top-quarter %llu nan %llu\n", j->name,
-                j->w, j->h, j->d, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], (unsigned long long)all,
-                (unsigned long long)top, (unsigned long long)nans);
+        fprintf(images_f, "%s %ux%ux%u min %g %g %g %g max %g %g %g %g distinct %llu top-quarter %llu nan-per-channel %llu %llu %llu %llu nan %llu\n",
+                j->name, j->w, j->h, j->d, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], (unsigned long long)all,
+                (unsigned long long)top, (unsigned long long)cnan[0], (unsigned long long)cnan[1], (unsigned long long)cnan[2],
+                (unsigned long long)cnan[3], (unsigned long long)nans);
         fflush(images_f);
     }
     ReleaseSRWLockExclusive(&img_lock);
@@ -595,6 +596,29 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                 if (ex->ssbo[st][k].addr)
                     sp(b, " %d=%#llx+%#llx", k, (unsigned long long)ex->ssbo[st][k].addr, (unsigned long long)ex->ssbo[st][k].size);
             sp(b, "\n");
+            // The first 64 bytes of the small ones, as the CPU holds them (imported pools only), and the pool class:
+            // pointers in storage buffers (vk_exec_draw.c ptr_targets_add) show here.
+            for (int k = 0; k < 16; k++) {
+                const p_bind_buf *sb = &ex->ssbo[st][k];
+                VkMemSpan msp;
+                if (!sb->addr || !sb->size || sb->size > 1024) continue;
+                int backed = vk_mem_resolve(sb->addr, sb->size, &msp);
+                sp(b, "      slot %d: class %d%s", k, backed ? msp.cls : -1, backed && msp.pool ? "" : " (not CPU-readable)");
+                if (backed && msp.pool)
+                    for (uint64_t o = 0; o + 8 <= sb->size && o < 64; o += 8)
+                        sp(b, " %016llx", (unsigned long long)*(const uint64_t *)(uintptr_t)(sb->addr + o));
+                sp(b, "\n");
+                // and 64 bytes at each word that is an address of CPU-readable pool memory, as 32-bit words
+                for (uint64_t o = 0; backed && msp.pool && o + 8 <= sb->size && o < 64; o += 8) {
+                    uint64_t v = *(const uint64_t *)(uintptr_t)(sb->addr + o);
+                    VkMemSpan tsp;
+                    if (v < 0x10000 || (v >> 40) || (v & 3) || !vk_mem_resolve(v, 64, &tsp)) continue;
+                    sp(b, "        +%#llx -> %#llx class %d:", (unsigned long long)o, (unsigned long long)v, tsp.cls);
+                    if (tsp.pool)
+                        for (int w = 0; w < 16; w++) sp(b, " %08x", ((const uint32_t *)(uintptr_t)v)[w]);
+                    sp(b, "\n");
+                }
+            }
             // The first words of each slot as the CPU sees them (the submission's snapshot, else guest memory): a
             // CPU-written buffer's contents, e.g. a record count a kernel loops to.
             for (int k = 0; k < 4; k++) {
@@ -1039,8 +1063,12 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     last_targets = 0;
     Str b = {0};
     describe_bindings(&b, ex, info);
-    fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx prog %llu caller %#llx, fence %llu\n%s", n, d->x, d->y,
-            d->z, (unsigned long long)shader_hash(cs), (unsigned long long)(ex->prog ? ex->prog->serial : 0),
+    const uint8_t *in_id = gfx_shader_input_id(cs);   // the id OOT_SKIP_CS and OOT_DUMP=cs: take, next to the hash
+    char in_hex[17] = "";
+    for (int i = 0; in_id && i < 8; i++) snprintf(in_hex + 2 * i, 3, "%02x", in_id[i]);
+    fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx (input %s) prog %llu caller %#llx, fence %llu\n%s", n,
+            d->x, d->y, d->z, (unsigned long long)shader_hash(cs), in_hex,
+            (unsigned long long)(ex->prog ? ex->prog->serial : 0),
             (unsigned long long)d->caller, (unsigned long long)ex->fence, b.s ? b.s : "");
     free(b.s);
     for (uint32_t i = 0; i < info->n_bindings && !pass_skip; i++) {   // storage images the dispatch writes

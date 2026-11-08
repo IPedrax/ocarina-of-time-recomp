@@ -45,6 +45,12 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 #define SM86_CONTROL_MAGIC 0x98761234u
 #define SM86_CONTROL_MIN 0xe0u    // the fixed part; the jump-table records follow it
 #define SM86_HEADER 0x80u         // the program header before a graphics stage's first instruction
+
+// OOT_PROBE (sm86_lower.c): whether the program with this code is the one being probed (it is lowered with the
+// capture), and the probe's text (for a cache key of its own); NULL without one.
+int sm86_probe_match(const uint8_t *code, uint32_t len);
+const char *sm86_probe_spec(void);
+
 // Task and mesh programs (docs/mesh.md): two pseudo instructions in Maxwell encodings no Maxwell instruction uses (top
 // byte 0x6c and 0x6d; Ryujinx's InstTable has nothing there), which a translator patch decodes.
 // SM86_ISBE_OP: the stage buffer, ISBERD or ISBEWR: bits 0-7 the register read into or written, 8-15 the address
