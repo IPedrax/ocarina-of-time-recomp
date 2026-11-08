@@ -3490,7 +3490,15 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
     vkCmdSetDepthTestEnable(cb, d->dt);
     vkCmdSetDepthWriteEnable(cb, d->dw);
-    vkCmdSetDepthCompareOp(cb, compare_op(d->df));
+    VkCompareOp dop = compare_op(d->df);
+    static int eq_relax = -1;   // OOT_DEPTH_EQUAL=le|ge (diagnostic): a depth EQUAL test becomes LESS_OR_EQUAL or GREATER_OR_EQUAL
+    if (eq_relax < 0) {
+        const char *e = cfg_get("OOT_DEPTH_EQUAL");
+        eq_relax = e && !strcmp(e, "le") ? 1 : e && !strcmp(e, "ge") ? 2 : 0;
+        if (eq_relax) rt_log("vk_pipeline: OOT_DEPTH_EQUAL=%s: depth EQUAL tests relaxed", e);
+    }
+    if (eq_relax && dop == VK_COMPARE_OP_EQUAL) dop = eq_relax == 1 ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_GREATER_OR_EQUAL;
+    vkCmdSetDepthCompareOp(cb, dop);
     vkCmdSetStencilTestEnable(cb, d->st);
     vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, stencil_op(d->fail_f), stencil_op(d->zpass_f), stencil_op(d->zfail_f),
                       compare_op(d->sf_f));
