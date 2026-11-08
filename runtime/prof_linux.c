@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   // REG_RIP
 // Linux port of runtime/prof_win.c, with the same interface (host.h): frame timing (OOT_TRACE=perf), the render thread's
 // waits, the GPU and memory line of the 60-frame window, the frame-time summary, the performance overlay's counts and
 // the A/B switches rt_ab and rt_knob. prof_win.c is copied from metroid-prime-4-recomp @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0
@@ -7,9 +8,15 @@
 // threads with SuspendThread and reads their stacks through .pdata), OOT_ONE_PER_CORE (prof_win.c sets the process
 // affinity with Win32 calls; logged once when set). Thread ids come from plat_thread_id, times from kern_now_ns (which
 // is plat_now_ns, CLOCK_MONOTONIC), atomics are the GCC/Clang __atomic builtins in place of the Interlocked calls.
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 #include "cfg.h"
 #include "flight.h"
@@ -41,16 +48,90 @@ void perf_gpu_busy(uint64_t ns) { __atomic_fetch_add(&gpu_busy_total, ns, __ATOM
 
 uint64_t perf_gpu_busy_total(void) { return __atomic_load_n(&gpu_busy_total, __ATOMIC_RELAXED); }
 
+// ---- OOT_PROFILE=<path>: a sampling profiler. ITIMER_PROF ticks every OOT_PROFILE_US (default 1000) microseconds of the
+// process's CPU time, and the handler on whichever thread was running stores its instruction pointer and thread id.
+// The profile is text, as prof_win.c writes it (base, samples, thread lines, rip lines with a count each), plus the
+// process's mappings, so a sample in a library is told from one in the exe: tools/prof_report_linux.py resolves them.
+// shortcut: instruction pointers only, no call chains; add a frame-pointer walk when the hot function is not enough.
+enum { SAMP_MAX = 1 << 21 };
+typedef struct { uint64_t pc; uint32_t tid; } Samp;
+static Samp *samp;
+static uint32_t samp_n;
+static char samp_path[512];
+static int samp_us = 1000;
+static uint64_t samp_from_ns;   // OOT_PROFILE_AFTER=<seconds>: samples before this much run time are dropped
+
+static void samp_sig(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec < samp_from_ns) return;
+    uint32_t i = __atomic_fetch_add(&samp_n, 1, __ATOMIC_RELAXED);
+    if (i >= SAMP_MAX) return;
+    samp[i].pc = (uint64_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+    samp[i].tid = (uint32_t)syscall(SYS_gettid);
+}
+
+static void sampler_start(void) {
+    const char *p = cfg_get("OOT_PROFILE");
+    if (!p || !*p) return;
+    const char *us = cfg_get("OOT_PROFILE_US");
+    if (us && atoi(us) > 0) samp_us = atoi(us);
+    const char *after = cfg_get("OOT_PROFILE_AFTER");
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    samp_from_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec + (after ? (uint64_t)atoi(after) * 1000000000ull : 0);
+    samp = calloc(SAMP_MAX, sizeof *samp);
+    if (!samp) return;
+    snprintf(samp_path, sizeof samp_path, "%s", p);
+    struct sigaction sa = {.sa_sigaction = samp_sig, .sa_flags = SA_SIGINFO | SA_RESTART};
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, NULL);
+    struct itimerval it = {{0, samp_us}, {0, samp_us}};
+    setitimer(ITIMER_PROF, &it, NULL);
+    rt_log("prof: sampling every %d us into %s (OOT_PROFILE)", samp_us, samp_path);
+}
+
+static int samp_cmp(const void *a, const void *b) {
+    const Samp *x = a, *y = b;
+    return x->pc < y->pc ? -1 : x->pc > y->pc ? 1 : x->tid < y->tid ? -1 : x->tid > y->tid;
+}
+
+static void sampler_write(void) {
+    static int done;
+    if (!samp || __atomic_exchange_n(&done, 1, __ATOMIC_SEQ_CST)) return;
+    struct itimerval off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_PROF, &off, NULL);
+    uint32_t n = samp_n < SAMP_MAX ? samp_n : SAMP_MAX;
+    qsort(samp, n, sizeof *samp, samp_cmp);
+    FILE *f = fopen(samp_path, "w");
+    if (!f) return;
+    fprintf(f, "oot-prof 1\nbase %llx\nperiod_us %d\nsamples %u\n", (unsigned long long)plat_exe_base(), samp_us, n);
+    for (uint32_t i = 0, j; i < n; i = j) {   // one line per instruction pointer and thread
+        for (j = i; j < n && samp[j].pc == samp[i].pc && samp[j].tid == samp[i].tid; j++) {}
+        fprintf(f, "rip %llx %u %u\n", (unsigned long long)samp[i].pc, samp[i].tid, j - i);
+    }
+    fprintf(f, "role main %u\nrole render %u\nrole replay %u\n", main_tid, render_tid, replay_tid);
+    FILE *m = fopen("/proc/self/maps", "r");
+    char line[600];
+    while (m && fgets(line, sizeof line, m)) fprintf(f, "map %s", line);
+    if (m) fclose(m);
+    fclose(f);
+    rt_log("prof: %u samples written to %s", n, samp_path);
+}
+
 void prof_start(void) {
     flight_init();
     atexit(perf_summary_flush);   // the exit summary; prof_write does the same first when boot.c or the window closes
     perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
     perf_on = perf_base || overlay == 2;
-    const char *p = cfg_get("OOT_PROFILE");
-    if (p && *p) rt_log("prof: OOT_PROFILE: no sampling profiler on Linux yet, no profile is written");
+    sampler_start();
 }
 
-void prof_write(void) { perf_summary_flush(); }
+void prof_write(void) {
+    perf_summary_flush();
+    sampler_write();
+}
 
 // ---- OOT_TRACE=perf: frame interval and the time the render thread spends waiting, logged every 60 presents. The
 // flight recorder (OOT_FLIGHT=1, flight.c) takes the same numbers per frame.
