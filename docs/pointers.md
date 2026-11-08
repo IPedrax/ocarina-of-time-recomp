@@ -130,3 +130,11 @@ matters; to be measured with `OOT_MEMORY=verify`.
   equal to `vk_mem_resolve`'s buffer and offset; 10 of the 16 default blocks in use. The pool buffers now carry
   `SHADER_DEVICE_ADDRESS` (imports allocate with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`): 0 validation errors,
   frame rate unchanged. Entries name the imported buffer even when the pool has a VRAM mirror (P5). Next: P2.
+- 2026-11-08: #12 (Z-TOON) merged (7d185f2) with a run-time route of its own, which goes first: translator patch
+  0022 searches the stage's storage table in bank 0 for an address it cannot trace, 0023 skips a target that gets no
+  binding, and the host binds what small bound storage buffers point at into free slots (`vk_exec_draw.c
+  ptr_targets_add`, vs, fs and cs; `OOT_PTR_BIND=0` turns it off). The branch's own page table was left out for
+  P1's; `vk_mem_guest_pages` gives P1's table to shaders through the support buffer at byte 1408, so a shader can
+  read it without a storage binding (the P2 patch should use that rather than reserving a slot). `vk_mem_shutdown`
+  frees the table. P2 is to be rebuilt on top of 0022/0023 (the edits made before #12 are not in the tree). Hookshot
+  (`docs/level.md`) does both: a pointer-pool table at c0+0x880 for task, mesh and compute, and a page-table fallback.
