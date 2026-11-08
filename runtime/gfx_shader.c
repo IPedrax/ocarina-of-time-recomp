@@ -56,7 +56,7 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 27                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 28                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs); translator changes are covered by its identity
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
@@ -1590,13 +1590,21 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl, mesh ? &mj : NULL);
     sm86_lower_free(&low);
     int ok = svc_request(req, reply, sizeof reply);
+    if (ok && strncmp(reply, "ok ", 3)) {
+        // The translator refused it: the lowered program and the request stay, as <key>.xfail.code and .xfail.json,
+        // so it can be translated again by hand (oot_xlate <jobs file> <dir>, with the code path pointed there).
+        char keep[PATH_CAP + 80], msg[LINE_MAX_LEN + 64];
+        snprintf(keep, sizeof keep, "%s\\%s.xfail.json", cache_dir, hex), write_file(keep, req, strlen(req));
+        snprintf(keep, sizeof keep, "%s\\%s.xfail.code", cache_dir, hex);
+        if (!MoveFileExA(code_path, keep, MOVEFILE_REPLACE_EXISTING)) plat_file_delete(code_path);
+        free(req);
+        plat_file_delete(spv_path), plat_file_delete(res_path);
+        snprintf(msg, sizeof msg, "%s stage: %s", r->stage_name, reply);
+        return fail(msg, hex);
+    }
     free(req);
     plat_file_delete(code_path);
     if (!ok) return fail("translator unavailable", hex);
-    if (strncmp(reply, "ok ", 3)) {
-        plat_file_delete(spv_path), plat_file_delete(res_path);
-        return fail(reply, hex);
-    }
     plat_file_flush(spv_path), plat_file_flush(res_path);   // the translator wrote them; on disk before use or rename
     if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
     if (!r->final) {                                       // name the files after the cache key, remember the mask
