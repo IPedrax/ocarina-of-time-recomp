@@ -4,7 +4,7 @@
              return TypeInt(32, true);
          }
  
-+        // ocarina-of-time-recomp (patch 0024): the module declares PhysicalStorageBuffer addressing (guest page table accesses)
++        // ocarina-of-time-recomp (patch 0025): the module declares PhysicalStorageBuffer addressing (guest page table accesses)
 +        public bool UsesPhysicalPointers;
 +
          public Instruction TypeU32()
@@ -16,7 +16,7 @@
          {
              SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType);
  
-+            // ocarina-of-time-recomp (patch 0024): PhysicalStorageBuffer accesses carry their alignment.
++            // ocarina-of-time-recomp (patch 0025): PhysicalStorageBuffer accesses carry their alignment.
 +            bool physical = operation.StorageKind == StorageKind.GlobalMemory;
 +
              if (isStore)
@@ -55,7 +55,7 @@
              switch (storageKind)
              {
 +                case StorageKind.GlobalMemory:
-+                    // ocarina-of-time-recomp (patch 0024): GlobalToStorage leaves a global access only once its address
++                    // ocarina-of-time-recomp (patch 0025): GlobalToStorage leaves a global access only once its address
 +                    // is a device address (EmitGuestPageWalk): a 32-bit word through a PhysicalStorageBuffer pointer.
 +                    if (!context.UsesPhysicalPointers)
 +                    {
@@ -85,7 +85,7 @@
          TfeOffset,
          TfeVertexCount,
          PointSize,
-+        GuestPages, // ocarina-of-time-recomp (patch 0024): the guest page table's directory, a 64-bit device address
++        GuestPages, // ocarina-of-time-recomp (patch 0025): the guest page table's directory, a 64-bit device address
      }
  
      public struct SupportBuffer
@@ -114,7 +114,7 @@
              {
 -                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
 -                {
-+                // ocarina-of-time-recomp (patch 0024): the next node is taken before the current one may be deleted (a
++                // ocarina-of-time-recomp (patch 0025): the next node is taken before the current one may be deleted (a
 +                // store that found no binding, below). Upstream stepped from the deleted node, whose Next is null once it
 +                // leaves the list: the rest of the block kept its global accesses and the SPIR-V backend threw.
 +                LinkedListNode<INode> next;
@@ -133,7 +133,7 @@
 -                            if (operation.Dest != null)
 +                            if (operation.StorageKind == StorageKind.GlobalMemory)
 +                            {
-+                                // ocarina-of-time-recomp (patch 0024): no binding left, but the guest page table
++                                // ocarina-of-time-recomp (patch 0025): no binding left, but the guest page table
 +                                // reaches any address: the access is kept and follows it.
 +                                EmitGuestPageWalk(node, operation);
 +                            }
@@ -154,11 +154,11 @@
              }
          }
  
-+        // ocarina-of-time-recomp (patch 0024): TryGenerateMultiTargetStorageOp's functionId when the access is to follow
++        // ocarina-of-time-recomp (patch 0025): TryGenerateMultiTargetStorageOp's functionId when the access is to follow
 +        // its pointer through the guest page table.
 +        private const int FollowPointer = -2;
 +
-+        // ocarina-of-time-recomp (patch 0024): the access's 40-bit guest address becomes a device address. The host's guest
++        // ocarina-of-time-recomp (patch 0025): the access's 40-bit guest address becomes a device address. The host's guest
 +        // page table (runtime/vk_memory.c, "guest page table"), whose directory address is the support buffer's
 +        // guest_pages, has 1024 directory entries (one per GiB) of blocks of 262144 entries (one per 4 KiB page), each
 +        // the 64-bit device address of the page's first byte; unbacked pages point at a zeroed page. The access keeps
@@ -242,7 +242,7 @@
 +
 +            if (targetCbs.Count == 0 && operation.StorageKind == StorageKind.GlobalMemory)
 +            {
-+                // ocarina-of-time-recomp (patch 0024): a 32-bit access whose address traces to no constant buffer entry
++                // ocarina-of-time-recomp (patch 0025): a 32-bit access whose address traces to no constant buffer entry
 +                // follows the pointer through the guest page table (EmitGuestPageWalk). The level's GPU-driven kernels
 +                // walk chains of pointers that no set of 16 bindings can cover.
 +                functionId = FollowPointer;

@@ -50,9 +50,12 @@ the title plays at 60 fps. The shader cache keys carry the translator identity a
 a minute building the kernels' pipelines (the driver's disk cache keeps them). The start-up crash that killed
 about one run in two right after the first frame is fixed (`docs/phase3.md`, "the start-up crash"). Pool-indexed
 (bindless) textures are bound through a persistent pool set with GPU sampling
-feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon); the level's geometry is still black with them; the level's
-programs now lower (all but two), and the black is the colour pass's mesh-shader draws, which are stubs:
-`docs/mesh.md` is the hand-off for mesh and task shaders.
+feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon). Mesh and task shaders: `docs/mesh.md` and
+`docs/mesh-tracker.md`; pointers that shaders load from memory: `docs/pointers.md`. Since #12 (2026-11-08) the level
+draws its geometry at about 59 fps, with large white areas and stretched triangles, and two kernels skipped by default
+(`SKIP_CS_DEFAULT`): `docs/level.md` is the hand-off for that (measurements, what Fritchii and Hookshot do, the plan).
+`python3.14 tools/shader_census.py --version v131072 --lower` lowers the whole corpus (14,363 programs) and lists
+the refusals in `build/v131072/shaders/lowered.txt`.
 
 ## Running and checking
 

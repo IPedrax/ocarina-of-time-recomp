@@ -3159,8 +3159,9 @@ static int ptr_readable(uint64_t a, uint64_t n) {
     VkMemSpan sp;
     return a && vk_mem_resolve(a, n, &sp) && sp.pool;
 }
-// st: NVN_STAGE_CS for a dispatch, NVN_STAGE_VS or NVN_STAGE_FS for a draw (the stages whose storage table the
-// translator's fallback searches: c0 0x310, 0x110, 0x510).
+// st: NVN_STAGE_CS for a dispatch, NVN_STAGE_VS or NVN_STAGE_FS for a draw, NVN_STAGE_TS, NVN_STAGE_MS or
+// NVN_STAGE_FS for a mesh draw (the stages whose storage table the translator's fallback searches: c0 0x310, 0x110,
+// 0x510, and 0x670 and 0x770 with patch 0024).
 static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
     p_bind_buf *sb = ex->ssbo[st];
     memcpy(saved, sb, 16 * sizeof *sb);
@@ -3203,7 +3204,8 @@ static int ptr_targets_add(VkExec *ex, int st, p_bind_buf saved[16]) {
             if (fresh)
                 rt_log("vk_exec: pointer %#llx at %#llx+%#llx of %s storage slot %d bound to free slot %d (%llu bytes)",
                        (unsigned long long)v, (unsigned long long)base, (unsigned long long)o,
-                       st == NVN_STAGE_CS ? "compute" : st == NVN_STAGE_VS ? "vertex" : "fragment", k, free_slot,
+                       st == NVN_STAGE_CS ? "compute" : st == NVN_STAGE_VS ? "vertex" : st == NVN_STAGE_TS ? "task" :
+                       st == NVN_STAGE_MS ? "mesh" : "fragment", k, free_slot,
                        (unsigned long long)sb[free_slot].size);
         }
     }
@@ -3302,6 +3304,22 @@ static void op_draw_ptr(VkExec *ex, int op, const void *payload) {
     default: op_draw_idx_ind(ex, payload); break;
     }
     for (int i = 0; i < 2; i++) {
+        ptr_slots[st[i]] = 0;
+        if (added[i]) memcpy(ex->ssbo[st[i]], saved[i], sizeof saved[i]);
+    }
+}
+
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d);
+// A mesh draw with the pointer targets of its task, mesh and fragment storage buffers bound for it, as op_draw_ptr
+// does for draws (docs/level.md, plan item 1: Hookshot's notes put skinned models collapsing into spikes on these
+// pointers), then the game's bindings.
+static void op_draw_mesh_ptr(VkExec *ex, const p_draw_mesh *d) {
+    static const int st[3] = {NVN_STAGE_TS, NVN_STAGE_MS, NVN_STAGE_FS};
+    p_bind_buf saved[3][16];
+    int added[3];
+    for (int i = 0; i < 3; i++) added[i] = ptr_targets_add(ex, st[i], saved[i]);
+    op_draw_mesh(ex, d);
+    for (int i = 0; i < 3; i++) {
         ptr_slots[st[i]] = 0;
         if (added[i]) memcpy(ex->ssbo[st[i]], saved[i], sizeof saved[i]);
     }
@@ -3699,7 +3717,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_IND: op_draw_ptr(ex, op, payload); break;
     case OP_DISPATCH: op_dispatch_ptr(ex, payload, 0); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
     case OP_DISPATCH_IND: op_dispatch_ptr(ex, payload, 1); ex->push_cc_len = 0; break;
-    case OP_DRAW_MESH: op_draw_mesh(ex, payload); break;
+    case OP_DRAW_MESH: op_draw_mesh_ptr(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }

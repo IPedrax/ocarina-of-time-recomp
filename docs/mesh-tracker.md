@@ -204,3 +204,6 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
 - 2026-11-08: the design for that is `docs/pointers.md` (an address table from GPU addresses to Vulkan device
   addresses, the translator's fallback through it, first under `OOT_MEMORY=import`, mirrors second); its plan P1-P6
   comes before E1 here.
+- 2026-11-08: with #12 merged the level draws its geometry (mesh draws included) but with white areas and stretched
+  triangles; the shadow pass's indirect mesh records still read 0 (dumps 455, 456). `docs/level.md` gathers the
+  state and the plan; its first item is the pointer-pool table at c0+0x880 for task, mesh and compute stages.
