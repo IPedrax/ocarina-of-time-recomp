@@ -175,3 +175,13 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   stages 5, 0 and 1 (`c0_fill` / `nvn2_c0_fill_cs`): stages 6 and 7 read zeros there. Next: read back the storage
   buffers of the chain's first kernels (a readback like OOT_MESH_IND_LOG's, over each written binding) to see which
   stage produces nothing, and give task and mesh stages their bank 0.
+- 2026-11-08: task and mesh stages have their bank 0 (588f3b7): NVN2 keeps their storage-buffer tables at 0x670
+  (task) and 0x770 (mesh) and nothing else there; the game's task programs read storage slot 0 from it. NVN2 compute
+  kernels get the uniform-buffer table that comes before their storage table in bank 0 (control +0xb1 slots,
+  fcb2936): ace1cec0, the level's 1.5 s kernel, has six and read its loop bounds through null. On the level route
+  (150 s, `--replay build/logs/a-spam.txt --skip-movies`) main before these lost the device (`vkQueueSubmit2` -4,
+  one run), as did the new build with `OOT_NVN2_UBO_TABLE=0`; with the table the run reaches the end with 0
+  validation errors and 0 shader failures (run 439). The picture is unchanged: the shot at 150 s is all black
+  (`build/logs/bank0-level.png`). Not yet measured: whether the culling chain's indirect records are still zero with
+  the uniform table in place (`OOT_MESH_IND_LOG=<frame>`, 329a74a, starts the readback at the level). Next: that
+  readback; if they are, the readback of the chain's first kernels' storage buffers, as above.
